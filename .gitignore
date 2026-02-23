@@ -1,0 +1,10 @@
+__pycache__/
+.venv
+checkpoints_octcube/
+selected_images/
+macula_oct_partially_deduplicated.tsv
+optic_nerve_oct_partially_deduplicated.tsv
+training_splits.csv
+regression_scatter.png
+octcube_metrics.png
+config.json
