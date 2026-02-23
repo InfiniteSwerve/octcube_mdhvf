@@ -8,3 +8,4 @@ training_splits.csv
 regression_scatter.png
 octcube_metrics.png
 config.json
+uv.lock
