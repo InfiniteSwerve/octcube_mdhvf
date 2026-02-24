@@ -164,7 +164,6 @@ def extract_better_features():
     all_feats = {
         'mean_raw': [],       # Current approach (no fc_norm)
         'mean_normed': [],    # Mean pool + fc_norm (the correct way)
-        'cls_token': [],      # CLS token output
         'max_pool': [],       # Max pool + fc_norm
         'mean_max': [],       # Concat mean+max (2048-dim)
         'attn_pool': [],      # AttentionPool from the trained head
@@ -180,35 +179,9 @@ def extract_better_features():
             # Rearrange (B, C, T, H, W) -> (B, T, C, H, W) for encoder
             x = rearrange(x, "B C T H W -> B T C H W")
 
-            # Get all tokens from encoder, but BEFORE the final norm + pool
-            # We need to go through forward_features manually
-            B, T, C, H, W = x.shape
-
-            # Patch embed
-            x_enc = vit.patch_embed(x)
-            _, T_patches, L, D = x_enc.shape
-
-            # Positional embeddings
-            if vit.sep_pos_embed:
-                x_enc = x_enc + vit.pos_embed_spatial.unsqueeze(1)
-                x_enc = x_enc + vit.pos_embed_temporal.unsqueeze(2)
-
-            x_enc = rearrange(x_enc, 'b t l d -> b (t l) d')
-
-            if vit.cls_embed:
-                cls_tokens = vit.cls_token.expand(B, -1, -1)
-                x_enc = torch.cat([cls_tokens, x_enc], dim=1)
-
-            x_enc = vit.pos_drop(x_enc)
-
-            for blk in vit.blocks:
-                x_enc = blk(x_enc)
-
-            x_enc = vit.norm(x_enc)
-
-            # Now x_enc is (B, 1+T*L, D) with cls token at position 0
-            cls_out = x_enc[:, 0]                    # (B, D)
-            patch_tokens = x_enc[:, 1:]               # (B, T*L, D)
+            # Use the encoder's forward path which handles pos embed interpolation
+            tokens = model.encoder(x, return_all_tokens=True)  # (B, T_patches, L, D)
+            patch_tokens = tokens.flatten(1, 2)                 # (B, N, D)
 
             # Different pooling strategies
             mean_raw = patch_tokens.mean(dim=1).float()
@@ -222,7 +195,6 @@ def extract_better_features():
 
             all_feats['mean_raw'].append(mean_raw.cpu())
             all_feats['mean_normed'].append(mean_normed.cpu())
-            all_feats['cls_token'].append(cls_out.float().cpu())
             all_feats['max_pool'].append(max_pool.cpu())
             all_feats['mean_max'].append(mean_max.cpu())
             all_feats['attn_pool'].append(attn_pool.cpu())
@@ -257,7 +229,7 @@ def compare_pooling_strategies(results=None, labels=None):
         # Load from saved files
         results = {}
         labels = np.load('labels_v2.npy') if Path('labels_v2.npy').exists() else np.load('labels.npy')
-        for name in ['mean_raw', 'mean_normed', 'cls_token', 'max_pool', 'mean_max', 'attn_pool', 'std_pool']:
+        for name in ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'attn_pool', 'std_pool']:
             p = Path(f'features_{name}.npy')
             if p.exists():
                 results[name] = np.load(p)
