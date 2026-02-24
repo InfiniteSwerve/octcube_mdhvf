@@ -129,7 +129,7 @@ def diagnose_existing_features():
 
 # ── Step 2: Better feature extraction ──────────────────────────────
 
-def _extract_worker(gpu_id, split_name, indices, batch_size, out_dir, compile_model=True):
+def _extract_worker(gpu_id, split_name, indices, batch_size, out_dir):
     """Worker function: extract features for a subset of indices on one GPU."""
     from dataset import HVFDataset
     from octcube import OCTCubeRegression
@@ -152,12 +152,6 @@ def _extract_worker(gpu_id, split_name, indices, batch_size, out_dir, compile_mo
         checkpoint_path=TrainConfig.checkpoint_path,
     ).to(device)
     model.eval()
-
-    if compile_model:
-        try:
-            model.encoder = torch.compile(model.encoder)
-        except Exception:
-            pass
 
     dataset = HVFDataset(
         split_label=split_name,
