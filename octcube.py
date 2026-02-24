@@ -1744,8 +1744,9 @@ class OCTCubeRegression(nn.Module):
         x = rearrange(x, "B T C H W -> B C T H W")
 
         tokens: Float[Tensor, "B Tp L D"] = self.encoder(x, return_all_tokens=True)
-        tokens = rearrange(tokens, "B Tp L D -> B (Tp L) D").mean(1)
-        return tokens
+        pooled: Float[Tensor, "B D"] = rearrange(tokens, "B Tp L D -> B (Tp L) D").mean(1)
+        pooled = F.layer_norm(pooled, (pooled.shape[-1],))
+        return pooled
     
 
 

@@ -1,6 +1,9 @@
 __pycache__/
 .venv
 checkpoints_octcube/
+extracted_features/
+features.npy
+labels.npy
 selected_images/
 macula_oct_partially_deduplicated.tsv
 optic_nerve_oct_partially_deduplicated.tsv
