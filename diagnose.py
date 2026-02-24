@@ -172,35 +172,37 @@ def extract_better_features():
     all_labels = []
     all_mrns = []
 
-    with torch.no_grad():
-        for batch in tqdm.tqdm(loader, desc="Extracting features"):
-            x = batch['frames'].cuda().half()
 
-            # Rearrange (B, C, T, H, W) -> (B, T, C, H, W) for encoder
-            x = rearrange(x, "B C T H W -> B T C H W")
+    with torch.amp.autocast("cuda"):
+        with torch.no_grad():
+            for batch in tqdm.tqdm(loader, desc="Extracting features"):
+                x = batch['frames'].cuda().half()
 
-            # Use the encoder's forward path which handles pos embed interpolation
-            tokens = model.encoder(x, return_all_tokens=True)  # (B, T_patches, L, D)
-            patch_tokens = tokens.flatten(1, 2)                 # (B, N, D)
+                # Rearrange (B, C, T, H, W) -> (B, T, C, H, W) for encoder
+                x = rearrange(x, "B C T H W -> B T C H W")
 
-            # Different pooling strategies
-            mean_raw = patch_tokens.mean(dim=1).float()
-            mean_normed = vit.fc_norm(patch_tokens.mean(dim=1)).float()
-            max_pool = vit.fc_norm(patch_tokens.max(dim=1).values).float()
-            mean_max = torch.cat([mean_normed, max_pool], dim=-1).float()
-            std_pool = patch_tokens.float().std(dim=1)
+                # Use the encoder's forward path which handles pos embed interpolation
+                tokens = model.encoder(x, return_all_tokens=True)  # (B, T_patches, L, D)
+                patch_tokens = tokens.flatten(1, 2)                 # (B, N, D)
 
-            # Attention pool from the regression head
-            attn_pool = model.head.pool(patch_tokens).float()
+                # Different pooling strategies
+                mean_raw = patch_tokens.mean(dim=1).float()
+                mean_normed = vit.fc_norm(patch_tokens.mean(dim=1)).float()
+                max_pool = vit.fc_norm(patch_tokens.max(dim=1).values).float()
+                mean_max = torch.cat([mean_normed, max_pool], dim=-1).float()
+                std_pool = patch_tokens.float().std(dim=1)
 
-            all_feats['mean_raw'].append(mean_raw.cpu())
-            all_feats['mean_normed'].append(mean_normed.cpu())
-            all_feats['max_pool'].append(max_pool.cpu())
-            all_feats['mean_max'].append(mean_max.cpu())
-            all_feats['attn_pool'].append(attn_pool.cpu())
-            all_feats['std_pool'].append(std_pool.cpu())
-            all_labels.append(batch['label'])
-            all_mrns.append(batch['mrn'])
+                # Attention pool from the regression head
+                attn_pool = model.head.pool(patch_tokens).float()
+
+                all_feats['mean_raw'].append(mean_raw.cpu())
+                all_feats['mean_normed'].append(mean_normed.cpu())
+                all_feats['max_pool'].append(max_pool.cpu())
+                all_feats['mean_max'].append(mean_max.cpu())
+                all_feats['attn_pool'].append(attn_pool.cpu())
+                all_feats['std_pool'].append(std_pool.cpu())
+                all_labels.append(batch['label'])
+                all_mrns.append(batch['mrn'])
 
     labels = torch.cat(all_labels).numpy()
     np.save('labels_v2.npy', labels)
