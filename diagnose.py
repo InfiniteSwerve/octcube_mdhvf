@@ -181,7 +181,6 @@ def extract_better_features(max_volumes=500):
             'max_pool': [],       # Max pool + LayerNorm
             'mean_max': [],       # Concat mean+max (2048-dim)
             'std_pool': [],       # Std across tokens (captures pathology spread)
-            'attn_pool': [],      # AttentionPool from the regression head
         }
         labels = []
 
@@ -206,14 +205,12 @@ def extract_better_features(max_volumes=500):
                     max_pool = F.layer_norm(max_vals, (max_vals.shape[-1],))
                     mean_max = torch.cat([mean_normed, max_pool], dim=-1)
                     std_pool = patch_tokens.float().std(dim=1)
-                    attn_pool = model.head.pool(patch_tokens).float()
 
                     feats_by_strategy['mean_raw'].append(mean_raw.cpu())
                     feats_by_strategy['mean_normed'].append(mean_normed.cpu())
                     feats_by_strategy['max_pool'].append(max_pool.cpu())
                     feats_by_strategy['mean_max'].append(mean_max.cpu())
                     feats_by_strategy['std_pool'].append(std_pool.cpu())
-                    feats_by_strategy['attn_pool'].append(attn_pool.cpu())
                     labels.append(batch['label'])
 
         y = torch.cat(labels).numpy()
@@ -247,7 +244,7 @@ def compare_pooling_strategies(results=None, labels=None):
         # Load from saved files (prefer extracted_features/ directory)
         results = {}
         out_dir = Path("extracted_features")
-        strategies = ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'attn_pool', 'std_pool']
+        strategies = ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'std_pool']
 
         if out_dir.exists():
             labels_path = out_dir / "labels_train.npy"
