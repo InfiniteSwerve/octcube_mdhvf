@@ -235,100 +235,103 @@ def extract_better_features(max_volumes=500):
 
 # ── Step 3: Compare pooling strategies ──────────────────────────────
 
-def compare_pooling_strategies(results=None, labels=None):
-    """Train Ridge/GBT on each feature variant, report R², and plot scatters."""
+def compare_pooling_strategies():
+    """Train Ridge/GBT on train set, evaluate on held-out test set."""
     from sklearn.linear_model import Ridge
     from sklearn.ensemble import GradientBoostingRegressor
-    from sklearn.model_selection import cross_val_score, cross_val_predict
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import make_pipeline
     from sklearn.metrics import r2_score
 
-    if results is None:
-        # Load from saved files (prefer extracted_features/ directory)
-        results = {}
-        out_dir = Path("extracted_features")
-        strategies = ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'std_pool', 'attn_pool']
+    out_dir = Path("extracted_features")
+    strategies = ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'std_pool', 'attn_pool']
 
-        if out_dir.exists():
-            labels_path = out_dir / "labels_train.npy"
-            labels = np.load(labels_path) if labels_path.exists() else None
-            for name in strategies:
-                p = out_dir / f"{name}_train.npy"
-                if p.exists():
-                    results[name] = np.load(p)
-        else:
-            labels = np.load('labels.npy') if Path('labels.npy').exists() else None
-            for name in strategies:
-                p = Path(f'features_{name}.npy')
-                if p.exists():
-                    results[name] = np.load(p)
+    if not out_dir.exists():
+        print("extracted_features/ not found. Run extract_better_features() first.")
+        return
 
-    if not results:
+    y_train = np.load(out_dir / "labels_train.npy")
+    y_test = np.load(out_dir / "labels_test.npy")
+
+    # Load available strategies
+    train_data = {}
+    test_data = {}
+    for name in strategies:
+        train_p = out_dir / f"{name}_train.npy"
+        test_p = out_dir / f"{name}_test.npy"
+        if train_p.exists() and test_p.exists():
+            train_data[name] = np.load(train_p)
+            test_data[name] = np.load(test_p)
+
+    if not train_data:
         print("No feature files found. Run extract_better_features() first.")
         return
 
-    dummy_mae = np.abs(labels - labels.mean()).mean()
-    print(f"\nDummy (predict mean) MAE: {dummy_mae:.4f}")
-    print(f"Label std: {labels.std():.4f}")
-    print(f"{'─'*90}")
-    print(f"{'Feature variant':<20} {'dim':>5} {'Ridge MAE':>12} {'Improvement':>12} {'GBT MAE':>12} {'GBT R²':>10}")
-    print(f"{'─'*90}")
+    dummy_mae = np.abs(y_test - y_train.mean()).mean()
+    print(f"\nDummy (predict mean) test MAE: {dummy_mae:.4f}")
+    print(f"Train label std: {y_train.std():.4f}, Test label std: {y_test.std():.4f}")
+    print(f"Train: {len(y_train)}, Test: {len(y_test)}")
+    print(f"{'─'*100}")
+    print(f"{'Feature variant':<20} {'dim':>5} {'Ridge MAE':>12} {'Ridge R²':>10} {'GBT MAE':>12} {'GBT R²':>10} {'Improvement':>12}")
+    print(f"{'─'*100}")
 
-    # Collect GBT cross-val predictions for scatter plots
-    gbt_predictions = {}
+    # Collect test predictions for scatter plots
+    gbt_test_preds = {}
 
-    for name, X in sorted(results.items()):
-        pipe = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
-        ridge_scores = cross_val_score(pipe, X, labels, cv=5, scoring='neg_mean_absolute_error')
-        ridge_mae = -ridge_scores.mean()
+    for name in sorted(train_data.keys()):
+        X_train = train_data[name]
+        X_test = test_data[name]
 
+        # Ridge: train on full train, predict on test
+        pipe_ridge = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        pipe_ridge.fit(X_train, y_train)
+        ridge_preds = pipe_ridge.predict(X_test)
+        ridge_mae = np.abs(y_test - ridge_preds).mean()
+        ridge_r2 = r2_score(y_test, ridge_preds)
+
+        # GBT: train on full train, predict on test
         pipe_gbt = make_pipeline(
             StandardScaler(),
             GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42)
         )
-        gbt_scores = cross_val_score(pipe_gbt, X, labels, cv=5, scoring='neg_mean_absolute_error')
-        gbt_mae = -gbt_scores.mean()
+        pipe_gbt.fit(X_train, y_train)
+        gbt_preds = pipe_gbt.predict(X_test)
+        gbt_mae = np.abs(y_test - gbt_preds).mean()
+        gbt_r2 = r2_score(y_test, gbt_preds)
+        gbt_test_preds[name] = gbt_preds
 
-        # Get out-of-fold predictions for R² and scatter plots
-        gbt_preds = cross_val_predict(pipe_gbt, X, labels, cv=5)
-        gbt_r2 = r2_score(labels, gbt_preds)
-        gbt_predictions[name] = gbt_preds
+        improvement = (1 - gbt_mae / dummy_mae) * 100
+        print(f"{name:<20} {X_train.shape[1]:>5} {ridge_mae:>12.4f} {ridge_r2:>10.4f} {gbt_mae:>12.4f} {gbt_r2:>10.4f} {improvement:>+11.1f}%")
 
-        improvement = (1 - ridge_mae / dummy_mae) * 100
-        print(f"{name:<20} {X.shape[1]:>5} {ridge_mae:>12.4f} {improvement:>+11.1f}% {gbt_mae:>12.4f} {gbt_r2:>10.4f}")
+    print(f"{'─'*100}")
 
-    print(f"{'─'*90}")
-
-    # ── Scatter plots: GBT predicted vs GT for each strategy ──
-    n_strategies = len(gbt_predictions)
+    # ── Scatter plots: GBT predicted vs GT on test set ──
+    n_strategies = len(gbt_test_preds)
     ncols = min(3, n_strategies)
     nrows = (n_strategies + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), squeeze=False)
 
-    for idx, (name, preds) in enumerate(sorted(gbt_predictions.items())):
+    for idx, (name, preds) in enumerate(sorted(gbt_test_preds.items())):
         ax = axes[idx // ncols][idx % ncols]
-        r2 = r2_score(labels, preds)
-        mae = np.abs(labels - preds).mean()
+        r2 = r2_score(y_test, preds)
+        mae = np.abs(y_test - preds).mean()
 
-        ax.scatter(labels, preds, alpha=0.4, s=15, edgecolors='none')
-        # Perfect prediction line
-        lims = [min(labels.min(), preds.min()), max(labels.max(), preds.max())]
+        ax.scatter(y_test, preds, alpha=0.4, s=15, edgecolors='none')
+        lims = [min(y_test.min(), preds.min()), max(y_test.max(), preds.max())]
         ax.plot(lims, lims, 'r--', linewidth=1, label='y=x')
         ax.set_xlabel('Ground Truth')
         ax.set_ylabel('Predicted')
-        ax.set_title(f'{name}\nMAE={mae:.4f}  R²={r2:.4f}')
+        ax.set_title(f'{name}\nTest MAE={mae:.4f}  Test R²={r2:.4f}')
         ax.set_aspect('equal', adjustable='box')
         ax.legend(loc='upper left', fontsize=8)
 
-    # Hide unused subplots
     for idx in range(n_strategies, nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     plt.tight_layout()
     plt.savefig('gbt_scatter_plots.png', dpi=150)
     plt.close()
-    print(f"\nSaved GBT scatter plots to gbt_scatter_plots.png")
+    print(f"\nSaved GBT test scatter plots to gbt_scatter_plots.png")
 
 
 # ── Step 4: Train MLP on frozen features ────────────────────────────
@@ -507,8 +510,8 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "extract":
         # Step 2: Extract better features (requires GPU + data)
-        results, labels = extract_better_features()
-        compare_pooling_strategies(results, labels)
+        extract_better_features()
+        compare_pooling_strategies()
     elif len(sys.argv) > 1 and sys.argv[1] == "compare":
         # Step 3: Compare already-extracted features
         compare_pooling_strategies()
