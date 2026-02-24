@@ -129,14 +129,12 @@ def diagnose_existing_features():
 
 # ── Step 2: Better feature extraction ──────────────────────────────
 
-def _extract_worker(gpu_id, split_name, indices, batch_size, out_dir):
-    """Worker function: extract features for a subset of indices on one GPU."""
-    from dataset import HVFDataset
+def _gpu_worker(gpu_id, work_queue, dataset, batch_size, results_dict, lock):
+    """Worker that pulls work from a shared queue until empty."""
     from octcube import OCTCubeRegression
     from main_octcube import TrainConfig
     from einops import rearrange
     import torch.nn.functional as F
-    import tqdm
     import time
 
     device = torch.device(f"cuda:{gpu_id}")
@@ -153,27 +151,31 @@ def _extract_worker(gpu_id, split_name, indices, batch_size, out_dir):
     ).to(device)
     model.eval()
 
-    dataset = HVFDataset(
-        split_label=split_name,
-        target_size=(TrainConfig.img_size, TrainConfig.img_size),
-        normalize=True
-    )
-    subset = torch.utils.data.Subset(dataset, indices)
-    loader = torch.utils.data.DataLoader(
-        subset,
-        batch_size=batch_size,
-        num_workers=min(8, TrainConfig.num_workers),
-        pin_memory=True,
-    )
-
     strategies = ['mean_raw', 'max_pool', 'attn_pool']
-    feats_by_strategy = {name: [] for name in strategies}
-    labels = []
-
+    n_processed = 0
     t0 = time.time()
-    with torch.no_grad():
-        with torch.amp.autocast("cuda"):
-            for batch in tqdm.tqdm(loader, desc=f"GPU{gpu_id}/{split_name}", position=gpu_id):
+
+    with torch.no_grad(), torch.amp.autocast("cuda"):
+        while True:
+            # Grab a chunk of indices from the queue
+            try:
+                chunk_idx, indices = work_queue.get_nowait()
+            except Exception:
+                break  # Queue empty, we're done
+
+            subset = torch.utils.data.Subset(dataset, indices)
+            loader = torch.utils.data.DataLoader(
+                subset,
+                batch_size=batch_size,
+                num_workers=min(4, batch_size * 2),
+                pin_memory=True,
+                persistent_workers=False,
+            )
+
+            chunk_feats = {name: [] for name in strategies}
+            chunk_labels = []
+
+            for batch in loader:
                 x = batch['frames'].to(device, non_blocking=True)
                 x = rearrange(x, "B C T H W -> B T C H W")
 
@@ -185,34 +187,49 @@ def _extract_worker(gpu_id, split_name, indices, batch_size, out_dir):
                 max_pool = F.layer_norm(max_vals, (max_vals.shape[-1],))
                 attn_pooled = model.head.pool(patch_tokens).float()
 
-                feats_by_strategy['mean_raw'].append(mean_raw.cpu())
-                feats_by_strategy['max_pool'].append(max_pool.cpu())
-                feats_by_strategy['attn_pool'].append(attn_pooled.cpu())
-                labels.append(batch['label'])
+                chunk_feats['mean_raw'].append(mean_raw.cpu())
+                chunk_feats['max_pool'].append(max_pool.cpu())
+                chunk_feats['attn_pool'].append(attn_pooled.cpu())
+                chunk_labels.append(batch['label'])
+
+            # Store results for this chunk
+            result = {name: torch.cat(v).numpy() for name, v in chunk_feats.items()}
+            y = torch.cat(chunk_labels).numpy()
+            n_processed += len(y)
+
+            with lock:
+                results_dict[chunk_idx] = (indices, result, y)
+                total_done = sum(len(v[2]) for v in results_dict.values())
+                print(f"  GPU{gpu_id}: chunk {chunk_idx} done ({len(y)} samples) | "
+                      f"total: {total_done} samples done")
 
     elapsed = time.time() - t0
-    y = torch.cat(labels).numpy()
-    result = {name: torch.cat(v).numpy() for name, v in feats_by_strategy.items()}
-    print(f"  GPU{gpu_id}/{split_name}: {len(y)} samples in {elapsed:.0f}s ({len(y)/elapsed:.1f} vol/s)")
-    return result, y
+    if n_processed > 0:
+        print(f"  GPU{gpu_id}: finished {n_processed} samples in {elapsed:.0f}s "
+              f"({n_processed/elapsed:.1f} vol/s)")
 
 
-def extract_better_features(max_volumes=None, batch_size=4, num_gpus=None):
-    """Extract features across multiple GPUs in parallel.
+def extract_better_features(max_volumes=None, batch_size=4, num_gpus=None, chunk_size=32):
+    """Extract features across multiple GPUs with dynamic work stealing.
+
+    Each GPU pulls chunks from a shared queue, so faster GPUs process more.
 
     Args:
         max_volumes: Max samples per split (None = all data).
         batch_size: Batch size per GPU. 4 fits comfortably in 40GB.
         num_gpus: Number of GPUs to use (None = auto-detect).
+        chunk_size: Samples per work unit. Smaller = better load balance.
     """
     from dataset import HVFDataset
     from main_octcube import TrainConfig
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
+    import queue
+    import threading
     import time
 
     if num_gpus is None:
         num_gpus = torch.cuda.device_count()
-    print(f"Using {num_gpus} GPUs, batch_size={batch_size} per GPU")
+    print(f"Using {num_gpus} GPUs, batch_size={batch_size}/GPU, chunk_size={chunk_size}")
 
     out_dir = Path("extracted_features")
     out_dir.mkdir(exist_ok=True)
@@ -220,7 +237,6 @@ def extract_better_features(max_volumes=None, batch_size=4, num_gpus=None):
     splits = ["train", "val", "test"]
 
     for split_name in splits:
-        # Get dataset size for this split
         dataset = HVFDataset(
             split_label=split_name,
             target_size=(TrainConfig.img_size, TrainConfig.img_size),
@@ -230,51 +246,44 @@ def extract_better_features(max_volumes=None, batch_size=4, num_gpus=None):
         if max_volumes is not None:
             n_total = min(n_total, max_volumes)
 
-        # Shard indices across GPUs
+        # Build work queue: each item is (chunk_id, list_of_indices)
         all_indices = list(range(n_total))
-        chunks = [all_indices[i::num_gpus] for i in range(num_gpus)]
+        work_queue = queue.Queue()
+        n_chunks = 0
+        for start in range(0, n_total, chunk_size):
+            chunk = all_indices[start:start + chunk_size]
+            work_queue.put((n_chunks, chunk))
+            n_chunks += 1
 
-        print(f"\n{split_name}: {n_total} samples across {num_gpus} GPUs "
-              f"({[len(c) for c in chunks]} per GPU)")
+        print(f"\n{split_name}: {n_total} samples in {n_chunks} chunks across {num_gpus} GPUs")
 
+        results_dict = {}
+        lock = threading.Lock()
         t0 = time.time()
 
-        # Launch workers in threads (GIL released during CUDA ops)
-        results_by_gpu = [None] * num_gpus
-        labels_by_gpu = [None] * num_gpus
-
         with ThreadPoolExecutor(max_workers=num_gpus) as pool:
-            futures = {}
+            futures = []
             for gpu_id in range(num_gpus):
-                if len(chunks[gpu_id]) == 0:
-                    continue
                 fut = pool.submit(
-                    _extract_worker, gpu_id, split_name,
-                    chunks[gpu_id], batch_size, out_dir,
+                    _gpu_worker, gpu_id, work_queue, dataset,
+                    batch_size, results_dict, lock,
                 )
-                futures[fut] = gpu_id
+                futures.append(fut)
+            # Wait for all to finish (and propagate exceptions)
+            for fut in futures:
+                fut.result()
 
-            for fut in as_completed(futures):
-                gpu_id = futures[fut]
-                result, y = fut.result()
-                results_by_gpu[gpu_id] = result
-                labels_by_gpu[gpu_id] = y
-
-        # Merge results (interleaved order from round-robin sharding)
-        # Reconstruct original order: GPU0 got indices 0,4,8,...  GPU1 got 1,5,9,...
+        # Merge results in original order
         strategies = ['mean_raw', 'max_pool', 'attn_pool']
         merged_feats = {name: np.empty((n_total, 1024), dtype=np.float32) for name in strategies}
         merged_labels = np.empty(n_total, dtype=np.float32)
 
-        for gpu_id in range(num_gpus):
-            if results_by_gpu[gpu_id] is None:
-                continue
-            idx_list = chunks[gpu_id]
+        for chunk_idx in sorted(results_dict.keys()):
+            indices, result, y = results_dict[chunk_idx]
             for name in strategies:
-                merged_feats[name][idx_list] = results_by_gpu[gpu_id][name]
-            merged_labels[idx_list] = labels_by_gpu[gpu_id]
+                merged_feats[name][indices] = result[name]
+            merged_labels[indices] = y
 
-        # Save
         np.save(out_dir / f"labels_{split_name}.npy", merged_labels)
         for name, arr in merged_feats.items():
             np.save(out_dir / f"{name}_{split_name}.npy", arr)
