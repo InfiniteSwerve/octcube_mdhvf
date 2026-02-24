@@ -331,6 +331,177 @@ def compare_pooling_strategies(results=None, labels=None):
     print(f"\nSaved GBT scatter plots to gbt_scatter_plots.png")
 
 
+# ── Step 4: Train MLP on frozen features ────────────────────────────
+
+def train_mlp_on_features(strategy='mean_raw', epochs=300, lr=1e-3, hidden_dims=(512, 256)):
+    """Train a simple MLP on saved frozen features with MSE loss.
+
+    Uses proper train/val/test splits already created by extract_better_features.
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import TensorDataset, DataLoader
+
+    out_dir = Path("extracted_features")
+
+    # Load data
+    X_train = np.load(out_dir / f"{strategy}_train.npy")
+    y_train = np.load(out_dir / "labels_train.npy")
+    X_val = np.load(out_dir / f"{strategy}_val.npy")
+    y_val = np.load(out_dir / "labels_val.npy")
+    X_test = np.load(out_dir / f"{strategy}_test.npy")
+    y_test = np.load(out_dir / "labels_test.npy")
+
+    print(f"Strategy: {strategy}")
+    print(f"Train: {X_train.shape[0]}, Val: {X_val.shape[0]}, Test: {X_test.shape[0]}")
+    print(f"Feature dim: {X_train.shape[1]}")
+    print(f"Label range: [{y_train.min():.4f}, {y_train.max():.4f}]")
+
+    # Standardize features (fit on train only)
+    mean = X_train.mean(axis=0)
+    std = X_train.std(axis=0) + 1e-8
+    X_train = (X_train - mean) / std
+    X_val = (X_val - mean) / std
+    X_test = (X_test - mean) / std
+
+    # Torch datasets
+    train_ds = TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.float32),
+    )
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+
+    X_val_t = torch.tensor(X_val, dtype=torch.float32)
+    y_val_t = torch.tensor(y_val, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32)
+    y_test_t = torch.tensor(y_test, dtype=torch.float32)
+
+    # Build MLP
+    in_dim = X_train.shape[1]
+    layers = []
+    prev = in_dim
+    for h in hidden_dims:
+        layers.extend([
+            nn.Linear(prev, h),
+            nn.BatchNorm1d(h),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        ])
+        prev = h
+    layers.append(nn.Linear(prev, 1))
+    model = nn.Sequential(*layers)
+
+    print(f"\nMLP: {in_dim} -> {' -> '.join(str(h) for h in hidden_dims)} -> 1")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {n_params:,}")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=20
+    )
+    loss_fn = nn.MSELoss()
+
+    # Training loop
+    best_val_mae = float('inf')
+    best_state = None
+    history = {'train_loss': [], 'val_mae': [], 'val_r2': []}
+
+    for epoch in range(epochs):
+        # Train
+        model.train()
+        epoch_loss = 0.0
+        for xb, yb in train_loader:
+            pred = model(xb).squeeze(-1)
+            loss = loss_fn(pred, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * len(xb)
+        epoch_loss /= len(train_ds)
+
+        # Validate
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_val_t).squeeze(-1)
+            val_mae = (val_pred - y_val_t).abs().mean().item()
+            ss_res = ((y_val_t - val_pred) ** 2).sum().item()
+            ss_tot = ((y_val_t - y_val_t.mean()) ** 2).sum().item()
+            val_r2 = 1 - ss_res / ss_tot
+
+        scheduler.step(val_mae)
+
+        history['train_loss'].append(epoch_loss)
+        history['val_mae'].append(val_mae)
+        history['val_r2'].append(val_r2)
+
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if (epoch + 1) % 50 == 0 or epoch == 0:
+            cur_lr = optimizer.param_groups[0]['lr']
+            print(f"  Epoch {epoch+1:3d}  loss={epoch_loss:.5f}  "
+                  f"val_MAE={val_mae:.4f}  val_R²={val_r2:.4f}  lr={cur_lr:.1e}")
+
+    # Load best and evaluate on test
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        test_pred = model(X_test_t).squeeze(-1).numpy()
+        val_pred_best = model(X_val_t).squeeze(-1).numpy()
+
+    test_mae = np.abs(y_test - test_pred).mean()
+    ss_res = ((y_test - test_pred) ** 2).sum()
+    ss_tot = ((y_test - y_test.mean()) ** 2).sum()
+    test_r2 = 1 - ss_res / ss_tot
+
+    dummy_mae_test = np.abs(y_test - y_train.mean()).mean()
+
+    print(f"\n{'─'*50}")
+    print(f"Best val MAE:      {best_val_mae:.4f}")
+    print(f"Test MAE:          {test_mae:.4f}")
+    print(f"Test R²:           {test_r2:.4f}")
+    print(f"Dummy MAE (test):  {dummy_mae_test:.4f}")
+    print(f"Improvement:       {(1 - test_mae / dummy_mae_test) * 100:+.1f}%")
+    print(f"{'─'*50}")
+
+    # ── Plots ──
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Training curves
+    axes[0].plot(history['train_loss'], label='Train loss', alpha=0.7)
+    axes[0].plot(history['val_mae'], label='Val MAE', alpha=0.7)
+    axes[0].axhline(dummy_mae_test, color='gray', linestyle='--', label='Dummy MAE')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss / MAE')
+    axes[0].set_title('Training curves')
+    axes[0].legend()
+
+    # Val scatter
+    axes[1].scatter(y_val, val_pred_best, alpha=0.4, s=15, edgecolors='none')
+    lims = [min(y_val.min(), val_pred_best.min()), max(y_val.max(), val_pred_best.max())]
+    axes[1].plot(lims, lims, 'r--', linewidth=1)
+    val_r2_best = 1 - ((y_val - val_pred_best)**2).sum() / ((y_val - y_val.mean())**2).sum()
+    axes[1].set_title(f'Val: MAE={np.abs(y_val - val_pred_best).mean():.4f}  R²={val_r2_best:.4f}')
+    axes[1].set_xlabel('Ground Truth')
+    axes[1].set_ylabel('Predicted')
+    axes[1].set_aspect('equal', adjustable='box')
+
+    # Test scatter
+    axes[2].scatter(y_test, test_pred, alpha=0.4, s=15, edgecolors='none')
+    lims = [min(y_test.min(), test_pred.min()), max(y_test.max(), test_pred.max())]
+    axes[2].plot(lims, lims, 'r--', linewidth=1)
+    axes[2].set_title(f'Test: MAE={test_mae:.4f}  R²={test_r2:.4f}')
+    axes[2].set_xlabel('Ground Truth')
+    axes[2].set_ylabel('Predicted')
+    axes[2].set_aspect('equal', adjustable='box')
+
+    plt.tight_layout()
+    plt.savefig('mlp_frozen_results.png', dpi=150)
+    plt.close()
+    print(f"Saved plots to mlp_frozen_results.png")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -341,6 +512,10 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "compare":
         # Step 3: Compare already-extracted features
         compare_pooling_strategies()
+    elif len(sys.argv) > 1 and sys.argv[1] == "mlp":
+        # Step 4: Train MLP on frozen features
+        strategy = sys.argv[2] if len(sys.argv) > 2 else "mean_raw"
+        train_mlp_on_features(strategy=strategy)
     else:
         # Step 1: Diagnose existing features (no GPU needed)
         print("=" * 60)
@@ -350,4 +525,5 @@ if __name__ == "__main__":
         print("\n" + "=" * 60)
         print("To extract better features:  python diagnose.py extract")
         print("To compare features:         python diagnose.py compare")
+        print("To train MLP on features:    python diagnose.py mlp [strategy]")
         print("=" * 60)
