@@ -129,14 +129,16 @@ def diagnose_existing_features():
 
 # ── Step 2: Better feature extraction ──────────────────────────────
 
-def extract_better_features(max_volumes=500):
+def extract_better_features(max_volumes=None, batch_size=2, compile_model=True):
     """Extract features using multiple pooling strategies, per split.
 
     Saves to extracted_features/{strategy}_{split}.npy and
     extracted_features/labels_{split}.npy.
 
-    Uses the encoder's built-in forward() which handles temporal pos embed
-    interpolation for variable frame counts.
+    Args:
+        max_volumes: Max samples per split (None = all data).
+        batch_size: Batch size for inference (2 should fit on most GPUs).
+        compile_model: Use torch.compile for ~20-40% speedup.
     """
     from dataset import HVFDataset
     from octcube import OCTCubeRegression
@@ -144,7 +146,7 @@ def extract_better_features(max_volumes=500):
     from einops import rearrange
     import torch.nn.functional as F
     import tqdm
-    import os
+    import time
 
     out_dir = Path("extracted_features")
     out_dir.mkdir(exist_ok=True)
@@ -160,9 +162,16 @@ def extract_better_features(max_volumes=500):
     ).cuda()
     model.eval()
 
+    if compile_model:
+        try:
+            model.encoder = torch.compile(model.encoder)
+            print("torch.compile enabled")
+        except Exception as e:
+            print(f"torch.compile failed ({e}), continuing without it")
+
+    # Only keep the 3 most distinct strategies
+    strategies = ['mean_raw', 'max_pool', 'attn_pool']
     splits = ["train", "val", "test"]
-    all_results = {}  # {strategy_name: np.array} for the last split (for compare)
-    all_labels = None
 
     for split_name in splits:
         loader = torch.utils.data.DataLoader(
@@ -171,66 +180,136 @@ def extract_better_features(max_volumes=500):
                 target_size=(TrainConfig.img_size, TrainConfig.img_size),
                 normalize=True
             ),
-            batch_size=1,
+            batch_size=batch_size,
             num_workers=TrainConfig.num_workers,
+            pin_memory=True,
         )
 
-        feats_by_strategy = {
-            'mean_raw': [],       # Mean pool, no normalization
-            'mean_normed': [],    # Mean pool + LayerNorm
-            'max_pool': [],       # Max pool + LayerNorm
-            'mean_max': [],       # Concat mean+max (2048-dim)
-            'std_pool': [],       # Std across tokens (captures pathology spread)
-            'attn_pool': [],      # Learned attention pooling (from regression head)
-        }
+        feats_by_strategy = {name: [] for name in strategies}
         labels = []
+        n_done = 0
 
+        t0 = time.time()
         with torch.no_grad():
             with torch.amp.autocast("cuda"):
-                for i, batch in enumerate(tqdm.tqdm(loader, desc=f"{split_name}")):
-                    if i >= max_volumes:
+                for batch in tqdm.tqdm(loader, desc=f"{split_name}"):
+                    if max_volumes is not None and n_done >= max_volumes:
                         break
 
-                    x = batch['frames'].cuda()
-                    # (B, C, T, H, W) -> (B, T, C, H, W) for encoder
+                    x = batch['frames'].cuda(non_blocking=True)
                     x = rearrange(x, "B C T H W -> B T C H W")
 
-                    # Use encoder's forward which handles pos embed interpolation
                     tokens = model.encoder(x, return_all_tokens=True)  # (B, Tp, L, D)
                     patch_tokens = tokens.flatten(1, 2)  # (B, Tp*L, D)
 
-                    # Pooling strategies
+                    # Pooling
                     mean_raw = patch_tokens.mean(dim=1).float()
-                    mean_normed = F.layer_norm(mean_raw, (mean_raw.shape[-1],))
                     max_vals = patch_tokens.max(dim=1).values.float()
                     max_pool = F.layer_norm(max_vals, (max_vals.shape[-1],))
-                    mean_max = torch.cat([mean_normed, max_pool], dim=-1)
-                    std_pool = patch_tokens.float().std(dim=1)
                     attn_pooled = model.head.pool(patch_tokens).float()
 
                     feats_by_strategy['mean_raw'].append(mean_raw.cpu())
-                    feats_by_strategy['mean_normed'].append(mean_normed.cpu())
                     feats_by_strategy['max_pool'].append(max_pool.cpu())
-                    feats_by_strategy['mean_max'].append(mean_max.cpu())
-                    feats_by_strategy['std_pool'].append(std_pool.cpu())
                     feats_by_strategy['attn_pool'].append(attn_pooled.cpu())
                     labels.append(batch['label'])
+                    n_done += x.shape[0]
 
+        elapsed = time.time() - t0
         y = torch.cat(labels).numpy()
+        if max_volumes is not None:
+            y = y[:max_volumes]
         np.save(out_dir / f"labels_{split_name}.npy", y)
 
         for name, feat_list in feats_by_strategy.items():
             arr = torch.cat(feat_list).numpy()
+            if max_volumes is not None:
+                arr = arr[:max_volumes]
             np.save(out_dir / f"{name}_{split_name}.npy", arr)
-            if split_name == "train":
-                all_results[name] = arr
-        if split_name == "train":
-            all_labels = y
 
-        print(f"{split_name}: {len(labels)} volumes extracted")
+        rate = len(y) / elapsed if elapsed > 0 else 0
+        print(f"{split_name}: {len(y)} volumes in {elapsed:.0f}s ({rate:.1f} vol/s)")
 
     print(f"\nFeature extraction complete! Saved to {out_dir}/")
-    return all_results, all_labels
+
+
+def scaling_curve(strategies=None, n_points=6):
+    """Plot R² vs training set size to see if performance is still climbing.
+
+    Requires features already extracted (the full set). Subsamples the
+    training data at geometrically spaced sizes and evaluates on the
+    full test set each time.
+    """
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import make_pipeline
+    from sklearn.metrics import r2_score
+
+    out_dir = Path("extracted_features")
+    if strategies is None:
+        strategies = ['mean_raw', 'max_pool', 'attn_pool']
+
+    y_train_full = np.load(out_dir / "labels_train.npy")
+    y_test = np.load(out_dir / "labels_test.npy")
+    N = len(y_train_full)
+
+    # Geometrically spaced sizes from 50 up to full N
+    sizes = np.unique(np.geomspace(50, N, n_points).astype(int))
+    sizes = [s for s in sizes if s <= N]
+
+    print(f"Scaling curve: {len(sizes)} sizes from {sizes[0]} to {sizes[-1]}")
+    print(f"Test set: {len(y_test)} samples")
+    print()
+
+    results = {}  # {strategy: {n: r2}}
+
+    for strat in strategies:
+        train_p = out_dir / f"{strat}_train.npy"
+        test_p = out_dir / f"{strat}_test.npy"
+        if not train_p.exists() or not test_p.exists():
+            print(f"Skipping {strat} (files not found)")
+            continue
+
+        X_train_full = np.load(train_p)
+        X_test = np.load(test_p)
+        results[strat] = {}
+
+        print(f"{strat}:")
+        for n in sizes:
+            # Subsample training set (deterministic: first n samples)
+            X_sub = X_train_full[:n]
+            y_sub = y_train_full[:n]
+
+            pipe = make_pipeline(
+                StandardScaler(),
+                GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42)
+            )
+            pipe.fit(X_sub, y_sub)
+            preds = pipe.predict(X_test)
+            r2 = r2_score(y_test, preds)
+            mae = np.abs(y_test - preds).mean()
+            results[strat][n] = r2
+            print(f"  N={n:>6d}  R²={r2:.4f}  MAE={mae:.4f}")
+
+        print()
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for strat, r2_by_n in results.items():
+        ns = sorted(r2_by_n.keys())
+        r2s = [r2_by_n[n] for n in ns]
+        ax.plot(ns, r2s, 'o-', label=strat, markersize=6)
+
+    ax.set_xlabel('Training set size (N)')
+    ax.set_ylabel('Test R²')
+    ax.set_title('Scaling curve: R² vs training data')
+    ax.set_xscale('log')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig('scaling_curve.png', dpi=150)
+    plt.close()
+    print(f"Saved scaling_curve.png")
 
 
 # ── Step 3: Compare pooling strategies ──────────────────────────────
@@ -244,8 +323,6 @@ def compare_pooling_strategies():
     from sklearn.metrics import r2_score
 
     out_dir = Path("extracted_features")
-    strategies = ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'std_pool', 'attn_pool']
-
     if not out_dir.exists():
         print("extracted_features/ not found. Run extract_better_features() first.")
         return
@@ -253,10 +330,22 @@ def compare_pooling_strategies():
     y_train = np.load(out_dir / "labels_train.npy")
     y_test = np.load(out_dir / "labels_test.npy")
 
-    # Load available strategies
+    # Auto-detect available strategies from files
     train_data = {}
     test_data = {}
-    for name in strategies:
+    for f in sorted(out_dir.glob("*_train.npy")):
+        name = f.stem.replace("_train", "")
+        if name == "labels":
+            continue
+        test_p = out_dir / f"{name}_test.npy"
+        if test_p.exists():
+            train_data[name] = np.load(f)
+            test_data[name] = np.load(test_p)
+
+    # Back-compat: also check legacy names
+    for name in ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'std_pool', 'attn_pool']:
+        if name in train_data:
+            continue
         train_p = out_dir / f"{name}_train.npy"
         test_p = out_dir / f"{name}_test.npy"
         if train_p.exists() and test_p.exists():
@@ -604,31 +693,38 @@ def overfit_test(strategy='mean_raw', n_samples=50, epochs=2000, lr=1e-3):
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "extract":
-        # Step 2: Extract better features (requires GPU + data)
-        extract_better_features()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else None
+
+    if cmd == "extract":
+        # Extract features (pass max_volumes, default=all)
+        max_vol = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        bs = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+        extract_better_features(max_volumes=max_vol, batch_size=bs)
+    elif cmd == "compare":
         compare_pooling_strategies()
-    elif len(sys.argv) > 1 and sys.argv[1] == "compare":
-        # Step 3: Compare already-extracted features
-        compare_pooling_strategies()
-    elif len(sys.argv) > 1 and sys.argv[1] == "mlp":
-        # Step 4: Train MLP on frozen features
+    elif cmd == "scaling":
+        scaling_curve()
+    elif cmd == "mlp":
         strategy = sys.argv[2] if len(sys.argv) > 2 else "mean_raw"
         train_mlp_on_features(strategy=strategy)
-    elif len(sys.argv) > 1 and sys.argv[1] == "overfit":
-        # Step 5: Can the MLP memorize a small subset?
+    elif cmd == "overfit":
         strategy = sys.argv[2] if len(sys.argv) > 2 else "mean_raw"
         n = int(sys.argv[3]) if len(sys.argv) > 3 else 50
         overfit_test(strategy=strategy, n_samples=n)
     else:
-        # Step 1: Diagnose existing features (no GPU needed)
         print("=" * 60)
         print("DIAGNOSING EXISTING FEATURES")
         print("=" * 60)
         diagnose_existing_features()
         print("\n" + "=" * 60)
-        print("To extract better features:  python diagnose.py extract")
-        print("To compare features:         python diagnose.py compare")
-        print("To train MLP on features:    python diagnose.py mlp [strategy]")
-        print("To test memorization:        python diagnose.py overfit [strategy] [n_samples]")
+        print("Usage:")
+        print("  python diagnose.py extract [max_volumes] [batch_size]")
+        print("    Extract features. Omit max_volumes for all data.")
+        print("    Example: python diagnose.py extract        # all data, bs=2")
+        print("    Example: python diagnose.py extract 5000   # first 5k per split")
+        print()
+        print("  python diagnose.py compare     # Ridge/GBT on extracted features")
+        print("  python diagnose.py scaling     # R² vs N scaling curve")
+        print("  python diagnose.py mlp [strategy]")
+        print("  python diagnose.py overfit [strategy] [n_samples]")
         print("=" * 60)
