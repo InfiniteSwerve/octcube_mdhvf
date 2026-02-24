@@ -505,6 +505,102 @@ def train_mlp_on_features(strategy='mean_raw', epochs=300, lr=1e-3, hidden_dims=
     print(f"Saved plots to mlp_frozen_results.png")
 
 
+def overfit_test(strategy='mean_raw', n_samples=50, epochs=2000, lr=1e-3):
+    """Can an MLP memorize a small subset? Tests if features carry any signal.
+
+    No dropout, no weight decay, no early stopping — pure memorization attempt.
+    If train loss doesn't approach zero, the features are effectively in the
+    null space for this task.
+    """
+    import torch
+    import torch.nn as nn
+
+    out_dir = Path("extracted_features")
+    X_train = np.load(out_dir / f"{strategy}_train.npy")
+    y_train = np.load(out_dir / "labels_train.npy")
+
+    # Take a small subset to make memorization easy
+    n = min(n_samples, len(X_train))
+    X = X_train[:n]
+    y = y_train[:n]
+
+    # Standardize
+    mean = X.mean(axis=0)
+    std = X.std(axis=0) + 1e-8
+    X = (X - mean) / std
+
+    X_t = torch.tensor(X, dtype=torch.float32)
+    y_t = torch.tensor(y, dtype=torch.float32)
+
+    # Deliberately overparameterized MLP, no regularization
+    model = nn.Sequential(
+        nn.Linear(X.shape[1], 512),
+        nn.ReLU(),
+        nn.Linear(512, 256),
+        nn.ReLU(),
+        nn.Linear(256, 128),
+        nn.ReLU(),
+        nn.Linear(128, 1),
+    )
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Overfit test: {n} samples, {X.shape[1]}-dim features, {n_params:,} params")
+    print(f"Label range: [{y.min():.4f}, {y.max():.4f}], std: {y.std():.4f}")
+    print(f"Dummy MSE (predict mean): {((y - y.mean())**2).mean():.6f}")
+    print()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    history = []
+    for epoch in range(epochs):
+        model.train()
+        pred = model(X_t).squeeze(-1)
+        loss = loss_fn(pred, y_t)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        mse = loss.item()
+        history.append(mse)
+
+        if (epoch + 1) % 200 == 0 or epoch == 0 or mse < 1e-6:
+            mae = (pred.detach() - y_t).abs().mean().item()
+            pred_std = pred.detach().std().item()
+            print(f"  Epoch {epoch+1:4d}  MSE={mse:.6f}  MAE={mae:.4f}  pred_std={pred_std:.4f}")
+            if mse < 1e-6:
+                print("  -> Successfully memorized!")
+                break
+
+    final_mse = history[-1]
+    dummy_mse = ((y - y.mean())**2).mean()
+    print(f"\n{'─'*50}")
+    print(f"Final train MSE:   {final_mse:.6f}")
+    print(f"Dummy MSE:         {dummy_mse:.6f}")
+    print(f"Ratio:             {final_mse / dummy_mse:.4f}")
+
+    if final_mse < dummy_mse * 0.01:
+        print("PASS: Model can memorize — features carry signal")
+    elif final_mse < dummy_mse * 0.5:
+        print("PARTIAL: Model learns something but can't fully memorize")
+    else:
+        print("FAIL: Model barely beats predicting the mean — features may be in null space")
+    print(f"{'─'*50}")
+
+    # Plot loss curve
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(history, label='Train MSE')
+    ax.axhline(dummy_mse, color='red', linestyle='--', label='Dummy MSE (predict mean)')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('MSE')
+    ax.set_title(f'Overfit test: {n} samples, {strategy}')
+    ax.set_yscale('log')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig('overfit_test.png', dpi=150)
+    plt.close()
+    print(f"Saved loss curve to overfit_test.png")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -519,6 +615,11 @@ if __name__ == "__main__":
         # Step 4: Train MLP on frozen features
         strategy = sys.argv[2] if len(sys.argv) > 2 else "mean_raw"
         train_mlp_on_features(strategy=strategy)
+    elif len(sys.argv) > 1 and sys.argv[1] == "overfit":
+        # Step 5: Can the MLP memorize a small subset?
+        strategy = sys.argv[2] if len(sys.argv) > 2 else "mean_raw"
+        n = int(sys.argv[3]) if len(sys.argv) > 3 else 50
+        overfit_test(strategy=strategy, n_samples=n)
     else:
         # Step 1: Diagnose existing features (no GPU needed)
         print("=" * 60)
@@ -529,4 +630,5 @@ if __name__ == "__main__":
         print("To extract better features:  python diagnose.py extract")
         print("To compare features:         python diagnose.py compare")
         print("To train MLP on features:    python diagnose.py mlp [strategy]")
+        print("To test memorization:        python diagnose.py overfit [strategy] [n_samples]")
         print("=" * 60)
