@@ -129,23 +129,25 @@ def diagnose_existing_features():
 
 # ── Step 2: Better feature extraction ──────────────────────────────
 
-def extract_better_features():
-    """Extract features using multiple pooling strategies and fc_norm."""
+def extract_better_features(max_volumes=500):
+    """Extract features using multiple pooling strategies, per split.
+
+    Saves to extracted_features/{strategy}_{split}.npy and
+    extracted_features/labels_{split}.npy.
+
+    Uses the encoder's built-in forward() which handles temporal pos embed
+    interpolation for variable frame counts.
+    """
     from dataset import HVFDataset
     from octcube import OCTCubeRegression
     from main_octcube import TrainConfig
     from einops import rearrange
+    import torch.nn.functional as F
     import tqdm
+    import os
 
-    loader = torch.utils.data.DataLoader(
-        HVFDataset(
-            split_label="train",
-            target_size=(TrainConfig.img_size, TrainConfig.img_size),
-            normalize=True
-        ),
-        batch_size=1,
-        num_workers=TrainConfig.num_workers,
-    )
+    out_dir = Path("extracted_features")
+    out_dir.mkdir(exist_ok=True)
 
     model = OCTCubeRegression(
         img_size=TrainConfig.img_size,
@@ -158,90 +160,77 @@ def extract_better_features():
     ).cuda()
     model.eval()
 
-    # Access the underlying ViT for fc_norm
-    vit = model.encoder.model
+    splits = ["train", "val", "test"]
+    all_results = {}  # {strategy_name: np.array} for the last split (for compare)
+    all_labels = None
 
-    all_feats = {
-        'mean_raw': [],       # Current approach (no fc_norm)
-        'mean_normed': [],    # Mean pool + fc_norm (the correct way)
-        'cls_token': [],      # CLS token output
-        'max_pool': [],       # Max pool + fc_norm
-        'mean_max': [],       # Concat mean+max (2048-dim)
-        'attn_pool': [],      # AttentionPool from the trained head
-        'std_pool': [],       # Std across tokens (captures variance = pathology spread)
-    }
-    all_labels = []
-    all_mrns = []
+    for split_name in splits:
+        loader = torch.utils.data.DataLoader(
+            HVFDataset(
+                split_label=split_name,
+                target_size=(TrainConfig.img_size, TrainConfig.img_size),
+                normalize=True
+            ),
+            batch_size=1,
+            num_workers=TrainConfig.num_workers,
+        )
 
-    with torch.no_grad():
-        with torch.amp.autocast("cuda"):
-            for batch in tqdm.tqdm(loader, desc="Extracting features"):
-                x = batch['frames'].cuda().half()
+        feats_by_strategy = {
+            'mean_raw': [],       # Mean pool, no normalization
+            'mean_normed': [],    # Mean pool + LayerNorm
+            'max_pool': [],       # Max pool + LayerNorm
+            'mean_max': [],       # Concat mean+max (2048-dim)
+            'std_pool': [],       # Std across tokens (captures pathology spread)
+            'attn_pool': [],      # AttentionPool from the regression head
+        }
+        labels = []
 
-                # Rearrange (B, C, T, H, W) -> (B, T, C, H, W) for encoder
-                x = rearrange(x, "B C T H W -> B T C H W")
+        with torch.no_grad():
+            with torch.amp.autocast("cuda"):
+                for i, batch in enumerate(tqdm.tqdm(loader, desc=f"{split_name}")):
+                    if i >= max_volumes:
+                        break
 
-                # Get all tokens from encoder, but BEFORE the final norm + pool
-                # We need to go through forward_features manually
-                B, T, C, H, W = x.shape
+                    x = batch['frames'].cuda()
+                    # (B, C, T, H, W) -> (B, T, C, H, W) for encoder
+                    x = rearrange(x, "B C T H W -> B T C H W")
 
-                # Patch embed
-                x_enc = vit.patch_embed(x)
-                _, T_patches, L, D = x_enc.shape
+                    # Use encoder's forward which handles pos embed interpolation
+                    tokens = model.encoder(x, return_all_tokens=True)  # (B, Tp, L, D)
+                    patch_tokens = tokens.flatten(1, 2)  # (B, Tp*L, D)
 
-                # Positional embeddings
-                if vit.sep_pos_embed:
-                    x_enc = x_enc + vit.pos_embed_spatial.unsqueeze(1)
-                    x_enc = x_enc + vit.pos_embed_temporal.unsqueeze(2)
+                    # Pooling strategies
+                    mean_raw = patch_tokens.mean(dim=1).float()
+                    mean_normed = F.layer_norm(mean_raw, (mean_raw.shape[-1],))
+                    max_vals = patch_tokens.max(dim=1).values.float()
+                    max_pool = F.layer_norm(max_vals, (max_vals.shape[-1],))
+                    mean_max = torch.cat([mean_normed, max_pool], dim=-1)
+                    std_pool = patch_tokens.float().std(dim=1)
+                    attn_pool = model.head.pool(patch_tokens).float()
 
-                x_enc = rearrange(x_enc, 'b t l d -> b (t l) d')
+                    feats_by_strategy['mean_raw'].append(mean_raw.cpu())
+                    feats_by_strategy['mean_normed'].append(mean_normed.cpu())
+                    feats_by_strategy['max_pool'].append(max_pool.cpu())
+                    feats_by_strategy['mean_max'].append(mean_max.cpu())
+                    feats_by_strategy['std_pool'].append(std_pool.cpu())
+                    feats_by_strategy['attn_pool'].append(attn_pool.cpu())
+                    labels.append(batch['label'])
 
-                if vit.cls_embed:
-                    cls_tokens = vit.cls_token.expand(B, -1, -1)
-                    x_enc = torch.cat([cls_tokens, x_enc], dim=1)
+        y = torch.cat(labels).numpy()
+        np.save(out_dir / f"labels_{split_name}.npy", y)
 
-                x_enc = vit.pos_drop(x_enc)
+        for name, feat_list in feats_by_strategy.items():
+            arr = torch.cat(feat_list).numpy()
+            np.save(out_dir / f"{name}_{split_name}.npy", arr)
+            if split_name == "train":
+                all_results[name] = arr
+        if split_name == "train":
+            all_labels = y
 
-                for blk in vit.blocks:
-                    x_enc = blk(x_enc)
+        print(f"{split_name}: {len(labels)} volumes extracted")
 
-                x_enc = vit.norm(x_enc)
-
-                # Now x_enc is (B, 1+T*L, D) with cls token at position 0
-                cls_out = x_enc[:, 0]                    # (B, D)
-                patch_tokens = x_enc[:, 1:]               # (B, T*L, D)
-
-                # Different pooling strategies
-                mean_raw = patch_tokens.mean(dim=1).float()
-                mean_normed = vit.fc_norm(patch_tokens.mean(dim=1)).float()
-                max_pool = vit.fc_norm(patch_tokens.max(dim=1).values).float()
-                mean_max = torch.cat([mean_normed, max_pool], dim=-1).float()
-                std_pool = patch_tokens.float().std(dim=1)
-
-                # Attention pool from the regression head
-                attn_pool = model.head.pool(patch_tokens).float()
-
-                all_feats['mean_raw'].append(mean_raw.cpu())
-                all_feats['mean_normed'].append(mean_normed.cpu())
-                all_feats['cls_token'].append(cls_out.float().cpu())
-                all_feats['max_pool'].append(max_pool.cpu())
-                all_feats['mean_max'].append(mean_max.cpu())
-                all_feats['attn_pool'].append(attn_pool.cpu())
-                all_feats['std_pool'].append(std_pool.cpu())
-                all_labels.append(batch['label'])
-                all_mrns.append(batch['mrn'])
-
-    labels = torch.cat(all_labels).numpy()
-    np.save('labels_v2.npy', labels)
-
-    results = {}
-    for name, feat_list in all_feats.items():
-        feat_arr = torch.cat(feat_list).numpy()
-        np.save(f'features_{name}.npy', feat_arr)
-        results[name] = feat_arr
-        print(f"Saved features_{name}.npy — shape {feat_arr.shape}")
-
-    return results, labels
+    print(f"\nFeature extraction complete! Saved to {out_dir}/")
+    return all_results, all_labels
 
 
 # ── Step 3: Compare pooling strategies ──────────────────────────────
@@ -255,13 +244,24 @@ def compare_pooling_strategies(results=None, labels=None):
     from sklearn.pipeline import make_pipeline
 
     if results is None:
-        # Load from saved files
+        # Load from saved files (prefer extracted_features/ directory)
         results = {}
-        labels = np.load('labels_v2.npy') if Path('labels_v2.npy').exists() else np.load('labels.npy')
-        for name in ['mean_raw', 'mean_normed', 'cls_token', 'max_pool', 'mean_max', 'attn_pool', 'std_pool']:
-            p = Path(f'features_{name}.npy')
-            if p.exists():
-                results[name] = np.load(p)
+        out_dir = Path("extracted_features")
+        strategies = ['mean_raw', 'mean_normed', 'max_pool', 'mean_max', 'attn_pool', 'std_pool']
+
+        if out_dir.exists():
+            labels_path = out_dir / "labels_train.npy"
+            labels = np.load(labels_path) if labels_path.exists() else None
+            for name in strategies:
+                p = out_dir / f"{name}_train.npy"
+                if p.exists():
+                    results[name] = np.load(p)
+        else:
+            labels = np.load('labels.npy') if Path('labels.npy').exists() else None
+            for name in strategies:
+                p = Path(f'features_{name}.npy')
+                if p.exists():
+                    results[name] = np.load(p)
 
     if not results:
         print("No feature files found. Run extract_better_features() first.")

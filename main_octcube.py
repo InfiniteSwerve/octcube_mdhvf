@@ -481,32 +481,6 @@ def full_supervised_run():
     ).cuda()
     print("Initialized Model")
 
-    # --- Feature extraction: save per-split to extracted_features/ ---
-    MAX_VOLUMES = 500
-    out_dir = "extracted_features"
-    os.makedirs(out_dir, exist_ok=True)
-
-    splits = {"train": train_loader, "val": val_loader, "test": test_loader}
-    for split_name, loader in splits.items():
-        all_features = []
-        all_labels = []
-        with torch.no_grad():
-            for i, batch in enumerate(tqdm.tqdm(loader, desc=split_name)):
-                if i >= MAX_VOLUMES:
-                    break
-                feats = model.extract_features(batch['frames'].cuda())
-                all_features.append(feats.cpu())
-                all_labels.append(batch['label'])
-
-        X = torch.cat(all_features).numpy()
-        y = torch.cat(all_labels).numpy()
-        np.save(os.path.join(out_dir, f"features_{split_name}.npy"), X)
-        np.save(os.path.join(out_dir, f"labels_{split_name}.npy"), y)
-        print(f"{split_name}: {X.shape[0]} volumes, features {X.shape}, labels {y.shape}")
-
-    print("Feature extraction complete! Saved to extracted_features/")
-    exit()
-
 #    optimizer = torch.optim.Adam(
 #        filter(lambda p: p.requires_grad, model.parameters()),
 #        lr=1e-3
