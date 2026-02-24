@@ -174,61 +174,62 @@ def extract_better_features():
     all_mrns = []
 
     with torch.no_grad():
-        for batch in tqdm.tqdm(loader, desc="Extracting features"):
-            x = batch['frames'].cuda().half()
+        with torch.amp.autocast("cuda"):
+            for batch in tqdm.tqdm(loader, desc="Extracting features"):
+                x = batch['frames'].cuda().half()
 
-            # Rearrange (B, C, T, H, W) -> (B, T, C, H, W) for encoder
-            x = rearrange(x, "B C T H W -> B T C H W")
+                # Rearrange (B, C, T, H, W) -> (B, T, C, H, W) for encoder
+                x = rearrange(x, "B C T H W -> B T C H W")
 
-            # Get all tokens from encoder, but BEFORE the final norm + pool
-            # We need to go through forward_features manually
-            B, T, C, H, W = x.shape
+                # Get all tokens from encoder, but BEFORE the final norm + pool
+                # We need to go through forward_features manually
+                B, T, C, H, W = x.shape
 
-            # Patch embed
-            x_enc = vit.patch_embed(x)
-            _, T_patches, L, D = x_enc.shape
+                # Patch embed
+                x_enc = vit.patch_embed(x)
+                _, T_patches, L, D = x_enc.shape
 
-            # Positional embeddings
-            if vit.sep_pos_embed:
-                x_enc = x_enc + vit.pos_embed_spatial.unsqueeze(1)
-                x_enc = x_enc + vit.pos_embed_temporal.unsqueeze(2)
+                # Positional embeddings
+                if vit.sep_pos_embed:
+                    x_enc = x_enc + vit.pos_embed_spatial.unsqueeze(1)
+                    x_enc = x_enc + vit.pos_embed_temporal.unsqueeze(2)
 
-            x_enc = rearrange(x_enc, 'b t l d -> b (t l) d')
+                x_enc = rearrange(x_enc, 'b t l d -> b (t l) d')
 
-            if vit.cls_embed:
-                cls_tokens = vit.cls_token.expand(B, -1, -1)
-                x_enc = torch.cat([cls_tokens, x_enc], dim=1)
+                if vit.cls_embed:
+                    cls_tokens = vit.cls_token.expand(B, -1, -1)
+                    x_enc = torch.cat([cls_tokens, x_enc], dim=1)
 
-            x_enc = vit.pos_drop(x_enc)
+                x_enc = vit.pos_drop(x_enc)
 
-            for blk in vit.blocks:
-                x_enc = blk(x_enc)
+                for blk in vit.blocks:
+                    x_enc = blk(x_enc)
 
-            x_enc = vit.norm(x_enc)
+                x_enc = vit.norm(x_enc)
 
-            # Now x_enc is (B, 1+T*L, D) with cls token at position 0
-            cls_out = x_enc[:, 0]                    # (B, D)
-            patch_tokens = x_enc[:, 1:]               # (B, T*L, D)
+                # Now x_enc is (B, 1+T*L, D) with cls token at position 0
+                cls_out = x_enc[:, 0]                    # (B, D)
+                patch_tokens = x_enc[:, 1:]               # (B, T*L, D)
 
-            # Different pooling strategies
-            mean_raw = patch_tokens.mean(dim=1).float()
-            mean_normed = vit.fc_norm(patch_tokens.mean(dim=1)).float()
-            max_pool = vit.fc_norm(patch_tokens.max(dim=1).values).float()
-            mean_max = torch.cat([mean_normed, max_pool], dim=-1).float()
-            std_pool = patch_tokens.float().std(dim=1)
+                # Different pooling strategies
+                mean_raw = patch_tokens.mean(dim=1).float()
+                mean_normed = vit.fc_norm(patch_tokens.mean(dim=1)).float()
+                max_pool = vit.fc_norm(patch_tokens.max(dim=1).values).float()
+                mean_max = torch.cat([mean_normed, max_pool], dim=-1).float()
+                std_pool = patch_tokens.float().std(dim=1)
 
-            # Attention pool from the regression head
-            attn_pool = model.head.pool(patch_tokens).float()
+                # Attention pool from the regression head
+                attn_pool = model.head.pool(patch_tokens).float()
 
-            all_feats['mean_raw'].append(mean_raw.cpu())
-            all_feats['mean_normed'].append(mean_normed.cpu())
-            all_feats['cls_token'].append(cls_out.float().cpu())
-            all_feats['max_pool'].append(max_pool.cpu())
-            all_feats['mean_max'].append(mean_max.cpu())
-            all_feats['attn_pool'].append(attn_pool.cpu())
-            all_feats['std_pool'].append(std_pool.cpu())
-            all_labels.append(batch['label'])
-            all_mrns.append(batch['mrn'])
+                all_feats['mean_raw'].append(mean_raw.cpu())
+                all_feats['mean_normed'].append(mean_normed.cpu())
+                all_feats['cls_token'].append(cls_out.float().cpu())
+                all_feats['max_pool'].append(max_pool.cpu())
+                all_feats['mean_max'].append(mean_max.cpu())
+                all_feats['attn_pool'].append(attn_pool.cpu())
+                all_feats['std_pool'].append(std_pool.cpu())
+                all_labels.append(batch['label'])
+                all_mrns.append(batch['mrn'])
 
     labels = torch.cat(all_labels).numpy()
     np.save('labels_v2.npy', labels)
