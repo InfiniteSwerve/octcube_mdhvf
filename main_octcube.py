@@ -480,22 +480,31 @@ def full_supervised_run():
         checkpoint_path=TrainConfig.checkpoint_path,
     ).cuda()
     print("Initialized Model")
-    all_features = []
-    all_labels = []
-    import einops
-    with torch.no_grad():
-        for batch in tqdm.tqdm(train_loader):
 
-            feats = model.extract_features(batch['frames'].cuda())
-            all_features.append(feats)
-            all_labels.append(batch['label'])
+    # Feature extraction with volume limit per split
+    MAX_VOLUMES = 500
+    feature_dir = "extracted_features"
+    os.makedirs(feature_dir, exist_ok=True)
 
-    X = torch.cat(all_features).numpy()
-    y = torch.cat(all_labels).numpy()
+    for split_name, loader in [("train", train_loader), ("val", val_loader), ("test", test_loader)]:
+        all_features = []
+        all_labels = []
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm.tqdm(loader, desc=f"Extracting {split_name}")):
+                if i >= MAX_VOLUMES:
+                    break
+                feats = model.extract_features(batch['frames'].cuda())
+                all_features.append(feats.cpu())
+                all_labels.append(batch['label'])
 
-    np.save('features.npy', X)
-    np.save('labels.npy', y)
-    print("done!")
+        X = torch.cat(all_features).numpy()
+        y = torch.cat(all_labels).numpy()
+
+        np.save(os.path.join(feature_dir, f"{split_name}_features.npy"), X)
+        np.save(os.path.join(feature_dir, f"{split_name}_labels.npy"), y)
+        print(f"{split_name}: {X.shape[0]} volumes, features shape {X.shape}")
+
+    print("Feature extraction complete! Saved to extracted_features/")
     exit()
 
 #    optimizer = torch.optim.Adam(
