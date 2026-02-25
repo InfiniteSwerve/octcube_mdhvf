@@ -151,6 +151,69 @@ def interpolate_temporal_pos_embed(model, checkpoint_model, new_num_frames, t_pa
 
 
 ########################################################################
+# LoRA (Low-Rank Adaptation)
+
+
+class LoRALinear(nn.Module):
+    """
+    Wraps an existing frozen nn.Linear with a low-rank adapter.
+
+    output = frozen_linear(x) + (x @ A^T @ B^T) * (alpha / rank)
+
+    Only A and B are trainable; the original weight stays frozen.
+    """
+
+    def __init__(self, orig: nn.Linear, rank: int = 16, alpha: float = 16.0):
+        super().__init__()
+        self.orig = orig
+        # Freeze original
+        for p in self.orig.parameters():
+            p.requires_grad = False
+
+        in_features = orig.in_features
+        out_features = orig.out_features
+
+        self.lora_A = nn.Parameter(torch.randn(rank, in_features) * (1.0 / rank))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.scale = alpha / rank
+
+    def forward(self, x):
+        base = self.orig(x)
+        # x: (..., in_features) -> lora_A: (rank, in) -> lora_B: (out, rank)
+        lora = F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
+        return base + lora
+
+
+def apply_lora_to_encoder(
+    encoder: nn.Module,
+    rank: int = 16,
+    alpha: float = 16.0,
+    targets: tuple[str, ...] = ("qkv", "proj"),
+) -> int:
+    """
+    Inject LoRA adapters into every Attention layer of the encoder.
+
+    Args:
+        encoder: OCTCubeWrapper (has .model.blocks)
+        rank: LoRA rank
+        alpha: LoRA scaling factor
+        targets: which attention sub-layers to adapt ("qkv" and/or "proj")
+
+    Returns:
+        Number of trainable parameters added.
+    """
+    count = 0
+    for block in encoder.model.blocks:
+        attn = block.attn
+        for name in targets:
+            orig_linear = getattr(attn, name)
+            lora_linear = LoRALinear(orig_linear, rank=rank, alpha=alpha)
+            setattr(attn, name, lora_linear)
+            count += sum(p.numel() for p in [lora_linear.lora_A, lora_linear.lora_B])
+    return count
+
+
+########################################################################
 # Core building blocks
 
 

@@ -25,7 +25,7 @@ import shutil
 from collections import deque
 import tqdm
 
-from octcube import OCTCubeRegression, beta_nll_loss
+from octcube import OCTCubeRegression, beta_nll_loss, apply_lora_to_encoder
 
 typechecked = jaxtyped(typechecker=beartype)
 
@@ -44,6 +44,11 @@ class TrainConfig:
     encoder_lr: float = 1e-5
     head_lr: float = 1e-3
     warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
+    grad_accum_steps: int = 4  # Gradient accumulation steps (effective batch = batch_size * accum)
+
+    # LoRA config for phase 2
+    lora_rank: int = 16
+    lora_alpha: float = 16.0
 
     # Model parameters
     img_size: int = 512
@@ -51,8 +56,8 @@ class TrainConfig:
     num_frames: int = 48
     t_patch_size: int = 3
     model_size: str = 'large'
-    phase1_batch_size: int = 2   # Larger batch OK — encoder frozen, no activation storage
-    phase2_batch_size: int = 1   # Encoder unfrozen, 24 blocks of activations tracked
+    phase1_batch_size: int = 2   # Also used for LoRA phase 2 (similar memory footprint)
+    phase2_batch_size: int = 1   # Only needed if doing full fine-tuning (no LoRA)
     num_workers: int = 25
 
     # Paths
@@ -287,8 +292,11 @@ def train_one_epoch(
     metrics: Metrics,
     scheduler=None,
 ):
-    """Training epoch - processes volumes in chunks."""
+    """Training epoch with gradient accumulation."""
     model.train()
+    accum = TrainConfig.grad_accum_steps
+
+    optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(train_dataloader):
         imgs = batch['frames']
@@ -298,12 +306,19 @@ def train_one_epoch(
             imgs,
             labels,
             model,
-            optimizer,
             scaler,
-            metrics,
+            accum,
         )
-        if scheduler is not None:
-            scheduler.step()
+
+        # Optimizer step on accumulation boundary
+        if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == len(train_dataloader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            if scheduler is not None:
+                scheduler.step()
 
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
@@ -313,36 +328,27 @@ def train_one_epoch(
             metrics.plot_metrics()
 
 
-
 @typechecked
 def one_training_step(
     images: Float[Tensor, "batches channels frames height width"],
     labels: Float[Tensor, "batches"],
     model: nn.Module,
-    optimizer: Optimizer,
     scaler: GradScaler,
-    metrics: Metrics,
+    accum_steps: int,
 ) -> tuple[dict[str, float], Tensor]:
-    """Single training step on a volume chunk."""
-    optimizer.zero_grad()
-
-
+    """Single micro-step: forward + scaled backward (no optimizer step)."""
     with torch.amp.autocast("cuda"):
-        # Get predictions: (1, T, num_classes, H, W)
         logits = model(images.half().cuda())
         alpha = logits[0]
         beta = logits[1]
 
         loss = beta_nll_loss(alpha, beta, labels.cuda())
+        # Scale loss by accumulation steps so the average gradient is correct
+        scaled_loss = loss / accum_steps
 
         pred = Beta(alpha, beta).mean
 
-
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    scaler.step(optimizer)
-    scaler.update()
+    scaler.scale(scaled_loss).backward()
 
     result = {"loss": np.exp(loss.item())}
     return result, pred
@@ -529,28 +535,34 @@ def full_supervised_run():
     print(f"Phase 1 complete. Head checkpoint saved to {phase1_path}")
 
     # ----------------------------------------------------------------
-    # Phase 2: End-to-end fine-tuning (encoder unfrozen + LR warmup)
+    # Phase 2: LoRA fine-tuning (encoder adapted via low-rank, not fully unfrozen)
     # ----------------------------------------------------------------
     print("=" * 60)
-    print(f"Phase 2: End-to-end fine-tuning for {TrainConfig.phase2_epochs} epochs (batch_size={TrainConfig.phase2_batch_size})")
+    print(f"Phase 2: LoRA fine-tuning for {TrainConfig.phase2_epochs} epochs (batch_size={TrainConfig.phase2_batch_size})")
+    print(f"  LoRA rank={TrainConfig.lora_rank}, alpha={TrainConfig.lora_alpha}")
     print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
     print("=" * 60)
 
-    train_loader, val_loader = make_loaders(TrainConfig.phase2_batch_size)
+    # Inject LoRA adapters into encoder attention layers (encoder weights stay frozen)
+    lora_params = apply_lora_to_encoder(
+        model.encoder,
+        rank=TrainConfig.lora_rank,
+        alpha=TrainConfig.lora_alpha,
+    )
+    print(f"LoRA injected: {lora_params:,} trainable params (vs ~300M frozen encoder)")
 
-    # Unfreeze encoder
-    for p in model.encoder.parameters():
-        p.requires_grad = True
-    print("Encoder unfrozen")
+    # LoRA keeps memory low — can reuse phase 1 batch size
+    train_loader, val_loader = make_loaders(TrainConfig.phase1_batch_size)
 
-    # New optimizer with separate LRs
+    # Collect only trainable params: LoRA adapters + head
+    lora_adapter_params = [p for p in model.encoder.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW([
-        {"params": model.encoder.parameters(), "lr": TrainConfig.encoder_lr},
+        {"params": lora_adapter_params, "lr": TrainConfig.encoder_lr},
         {"params": model.head.parameters(), "lr": TrainConfig.head_lr},
     ])
     scaler = GradScaler("cuda")
 
-    # Warmup scheduler for encoder LR
+    # Warmup scheduler for LoRA adapter LR
     total_phase2_steps = TrainConfig.phase2_epochs * len(train_loader)
     warmup_steps = int(TrainConfig.warmup_fraction * total_phase2_steps)
     scheduler = get_warmup_scheduler(optimizer, warmup_steps)
