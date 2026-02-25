@@ -1703,9 +1703,12 @@ class BetaRegressionHead(nn.Module):
 
     @beartype
     def forward(
-        self, x: Float[Tensor, "B N D"]
+        self, x: Float[Tensor, "B N D"] | Float[Tensor, "B D"]
     ) -> tuple[Float[Tensor, "B"], Float[Tensor, "B"]]:
-        pooled: Float[Tensor, "B D"] = self.pool(x)
+        if x.dim() == 2:
+            pooled = x  # Already pooled
+        else:
+            pooled = self.pool(x)
         ab: Float[Tensor, "B 2"] = self.mlp(pooled).clamp(max=50) + 1e-6
         alpha: Float[Tensor, "B"] = ab[:, 0]
         beta: Float[Tensor, "B"] = ab[:, 1]

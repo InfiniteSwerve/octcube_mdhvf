@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.amp.grad_scaler import GradScaler
 from torch.distributions import Beta
 import numpy as np
-from dataset import HVFDataset
+from dataset import HVFDataset, FeatureDataset
 import matplotlib.pyplot as plt
 import time
 from jaxtyping import Float, jaxtyped
@@ -25,7 +25,7 @@ import shutil
 from collections import deque
 import tqdm
 
-from octcube import OCTCubeRegression, beta_nll_loss, apply_lora_to_encoder
+from octcube import OCTCubeRegression, BetaRegressionHead, beta_nll_loss, apply_lora_to_encoder
 
 typechecked = jaxtyped(typechecker=beartype)
 
@@ -49,6 +49,10 @@ class TrainConfig:
     # LoRA config for phase 2
     lora_rank: int = 16
     lora_alpha: float = 16.0
+
+    # Pre-extracted features for phase 1 (skip encoder forward pass entirely)
+    feature_dir: str = "extracted_features"
+    feature_pool: str = "attn_pool"  # Which pooling: "attn_pool", "mean_raw", or "max_pool"
 
     # Model parameters
     img_size: int = 512
@@ -486,12 +490,87 @@ def make_loaders(batch_size):
     return train_loader, val_loader
 
 
+def phase1_on_features():
+    """Phase 1: Train head MLP on pre-extracted features. No encoder needed."""
+    fdir = TrainConfig.feature_dir
+    pool = TrainConfig.feature_pool
+
+    train_loader = torch.utils.data.DataLoader(
+        FeatureDataset(f"{fdir}/{pool}_train.npy", f"{fdir}/labels_train.npy"),
+        batch_size=256, shuffle=True, num_workers=4,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        FeatureDataset(f"{fdir}/{pool}_val.npy", f"{fdir}/labels_val.npy"),
+        batch_size=256, num_workers=4,
+    )
+
+    embed_dim = 1024 if TrainConfig.model_size == 'large' else 768
+    head = BetaRegressionHead(in_features=embed_dim, hidden_dim=256).cuda()
+
+    metrics = Metrics()
+    optimizer = torch.optim.AdamW(head.parameters(), lr=TrainConfig.head_lr)
+
+    print("=" * 60)
+    print(f"Phase 1: Training head on pre-extracted features ({pool})")
+    print(f"  {len(train_loader.dataset)} train, {len(val_loader.dataset)} val samples")
+    print(f"  batch_size=256, no encoder forward pass needed")
+    print("=" * 60)
+
+    for e in range(1, TrainConfig.phase1_epochs + 1):
+        metrics.current_epoch = e
+        head.train()
+        for batch in train_loader:
+            feats = batch["features"].cuda()
+            labels = batch["label"].cuda()
+
+            alpha, beta = head(feats)  # (B, D) -> head skips AttentionPool
+            loss = beta_nll_loss(alpha, beta, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            pred = Beta(alpha, beta).mean
+            metrics.append_regression(pred, batch["label"])
+            step_metrics = {"loss": np.exp(loss.item())}
+            step_metrics.update(metrics.get_regression_metrics())
+            metrics.append("train", step_metrics)
+
+        if metrics.should_plot_losses():
+            metrics.plot_metrics()
+        print(f"  Epoch {e}/{TrainConfig.phase1_epochs} done")
+
+    print("Phase 1 complete.")
+    return head.state_dict()
+
+
 def full_supervised_run():
-    """Two-phase training: head-only then end-to-end with encoder warmup."""
+    """Two-phase training: head on features, then LoRA fine-tuning on full model."""
     os.makedirs("selected_images", exist_ok=True)
     os.makedirs(TrainConfig.save_dir, exist_ok=True)
 
-    # Create model with encoder FROZEN for phase 1
+    latest_path = os.path.join(TrainConfig.save_dir, "latest.pt")
+
+    # ----------------------------------------------------------------
+    # Phase 1: Train head on pre-extracted features (seconds, not hours)
+    # ----------------------------------------------------------------
+    head_state = phase1_on_features()
+
+    # Save phase 1 head weights
+    phase1_path = os.path.join(TrainConfig.save_dir, "phase1_head.pt")
+    torch.save(head_state, phase1_path)
+    print(f"Phase 1 head saved to {phase1_path}")
+
+    # ----------------------------------------------------------------
+    # Phase 2: LoRA fine-tuning (full model with encoder + adapted head)
+    # ----------------------------------------------------------------
+    print("=" * 60)
+    print(f"Phase 2: LoRA fine-tuning for {TrainConfig.phase2_epochs} epochs")
+    print(f"  LoRA rank={TrainConfig.lora_rank}, alpha={TrainConfig.lora_alpha}")
+    print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
+    print("=" * 60)
+
+    # Now create the full model (encoder + head)
     model = OCTCubeRegression(
         img_size=TrainConfig.img_size,
         patch_size=TrainConfig.patch_size,
@@ -502,48 +581,11 @@ def full_supervised_run():
         checkpoint_path=TrainConfig.checkpoint_path,
     ).cuda()
 
-    metrics = Metrics()
-    scaler = GradScaler("cuda")
+    # Load phase 1 head weights into the full model's head
+    model.head.load_state_dict(head_state)
+    print("Loaded phase 1 head weights into full model")
 
-    latest_path = os.path.join(TrainConfig.save_dir, "latest.pt")
-    phase1_path = os.path.join(TrainConfig.save_dir, "phase1_final.pt")
-
-    # ----------------------------------------------------------------
-    # Phase 1: Train head only (encoder frozen)
-    # ----------------------------------------------------------------
-    print("=" * 60)
-    print(f"Phase 1: Training head only for {TrainConfig.phase1_epochs} epochs (batch_size={TrainConfig.phase1_batch_size})")
-    print("=" * 60)
-
-    train_loader, val_loader = make_loaders(TrainConfig.phase1_batch_size)
-
-    optimizer = torch.optim.AdamW(
-        model.head.parameters(),
-        lr=TrainConfig.head_lr,
-    )
-
-    for e in range(1, TrainConfig.phase1_epochs + 1):
-        metrics.current_epoch = e
-        print(f"Phase 1 - Epoch {e}/{TrainConfig.phase1_epochs}")
-        train_one_epoch(
-            model, optimizer, scaler,
-            train_loader, val_loader, metrics,
-        )
-        save_checkpoint(model, optimizer, scaler, metrics, latest_path)
-
-    save_checkpoint(model, optimizer, scaler, metrics, phase1_path)
-    print(f"Phase 1 complete. Head checkpoint saved to {phase1_path}")
-
-    # ----------------------------------------------------------------
-    # Phase 2: LoRA fine-tuning (encoder adapted via low-rank, not fully unfrozen)
-    # ----------------------------------------------------------------
-    print("=" * 60)
-    print(f"Phase 2: LoRA fine-tuning for {TrainConfig.phase2_epochs} epochs (batch_size={TrainConfig.phase2_batch_size})")
-    print(f"  LoRA rank={TrainConfig.lora_rank}, alpha={TrainConfig.lora_alpha}")
-    print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
-    print("=" * 60)
-
-    # Inject LoRA adapters into encoder attention layers (encoder weights stay frozen)
+    # Inject LoRA adapters into encoder attention layers
     lora_params = apply_lora_to_encoder(
         model.encoder,
         rank=TrainConfig.lora_rank,
@@ -551,7 +593,8 @@ def full_supervised_run():
     )
     print(f"LoRA injected: {lora_params:,} trainable params (vs ~300M frozen encoder)")
 
-    # LoRA keeps memory low — can reuse phase 1 batch size
+    metrics = Metrics()
+    scaler = GradScaler("cuda")
     train_loader, val_loader = make_loaders(TrainConfig.phase1_batch_size)
 
     # Collect only trainable params: LoRA adapters + head
@@ -560,7 +603,6 @@ def full_supervised_run():
         {"params": lora_adapter_params, "lr": TrainConfig.encoder_lr},
         {"params": model.head.parameters(), "lr": TrainConfig.head_lr},
     ])
-    scaler = GradScaler("cuda")
 
     # Warmup scheduler for LoRA adapter LR
     total_phase2_steps = TrainConfig.phase2_epochs * len(train_loader)

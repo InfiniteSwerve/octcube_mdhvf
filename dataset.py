@@ -102,3 +102,24 @@ class HVFDataset(torch.utils.data.Dataset):
         return len(self.data)
 
 
+class FeatureDataset(torch.utils.data.Dataset):
+    """Loads pre-extracted (N, 1024) features and (N,) labels from .npy files."""
+
+    def __init__(self, feature_path: str, label_path: str):
+        self.features = np.load(feature_path)
+        self.labels = np.load(label_path)
+        assert len(self.features) == len(self.labels), (
+            f"Feature/label length mismatch: {len(self.features)} vs {len(self.labels)}"
+        )
+        print(f"FeatureDataset: {len(self)} samples from {feature_path}")
+
+    def __getitem__(self, idx):
+        return {
+            "features": torch.from_numpy(self.features[idx]),
+            "label": torch.tensor(self.labels[idx], dtype=torch.float32),
+        }
+
+    def __len__(self):
+        return len(self.labels)
+
+
