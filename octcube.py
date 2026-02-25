@@ -208,6 +208,7 @@ def apply_lora_to_encoder(
         for name in targets:
             orig_linear = getattr(attn, name)
             lora_linear = LoRALinear(orig_linear, rank=rank, alpha=alpha)
+            lora_linear = lora_linear.to(orig_linear.weight.device)
             setattr(attn, name, lora_linear)
             count += sum(p.numel() for p in [lora_linear.lora_A, lora_linear.lora_B])
     return count
