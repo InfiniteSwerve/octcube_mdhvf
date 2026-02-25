@@ -623,7 +623,10 @@ def full_supervised_run():
     # Warmup scheduler for LoRA adapter LR
     total_phase2_steps = TrainConfig.phase2_epochs * len(train_loader)
     warmup_steps = int(TrainConfig.warmup_fraction * total_phase2_steps)
-    scheduler = get_warmup_scheduler(optimizer, warmup_steps)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # LambdaLR.__init__ calls step() before any optimizer.step()
+        scheduler = get_warmup_scheduler(optimizer, warmup_steps)
     print(f"Warmup: {warmup_steps} steps out of {total_phase2_steps} total")
 
     for e in range(1, TrainConfig.phase2_epochs + 1):
