@@ -53,7 +53,7 @@ class TrainConfig:
 
     # Pre-extracted features for phase 1 (skip encoder forward pass entirely)
     feature_dir: str = "extracted_features"
-    feature_pool: str = "attn_pool"  # Which pooling: "attn_pool", "mean_raw", or "max_pool"
+    feature_pool: str = "mean_raw"  # Must match AttentionPool init (mean pool at start)
 
     # Model parameters
     img_size: int = 512

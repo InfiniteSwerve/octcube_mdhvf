@@ -1678,9 +1678,14 @@ class OCTCubeSegmenter(nn.Module):
 # Beta distribution based regression head
 
 class AttentionPool(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, init: str = "mean"):
         super().__init__()
         self.attn = nn.Linear(dim, 1)
+        if init == "mean":
+            # Zero weights → attn(x) ≈ 0 for all tokens → softmax = 1/N → mean pool.
+            # Small noise breaks symmetry so gradients aren't identical.
+            nn.init.normal_(self.attn.weight, mean=0.0, std=1e-4)
+            nn.init.zeros_(self.attn.bias)
 
     @beartype
     def forward(
