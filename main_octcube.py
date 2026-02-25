@@ -36,7 +36,7 @@ class TrainConfig:
     step_size: int = 48  # Number of slices per volume chunk (must be divisible by t_patch_size=3)
     partial_val_interval: int = 500
     train_save_im: int = 30
-    plot_losses: int = 30
+    plot_losses: int = 10
 
     # Two-phase training
     phase1_epochs: int = 5    # Head-only (encoder frozen)
@@ -160,7 +160,7 @@ class Metrics:
                     else:
                         ax.scatter(iters, vals, label=split, s=50, zorder=5)
             ax.set_ylabel(metric_name)
-            if "dice" not in metric_name.lower():
+            if metric_name == "loss":
                 ax.set_yscale("log")
             ax.legend()
         axes[-1].set_xlabel("iteration")
@@ -352,17 +352,18 @@ def one_training_step(
 ) -> tuple[dict[str, float], Tensor]:
     """Single micro-step: forward + scaled backward (no optimizer step)."""
     with torch.amp.autocast("cuda"):
-        logits = model(images.half().cuda())
-        alpha = logits[0]
-        beta = logits[1]
+        logits = model(images.cuda())
+        alpha = logits[0].float()
+        beta = logits[1].float()
 
-        loss = beta_nll_loss(alpha, beta, labels.cuda())
-        # Scale loss by accumulation steps so the average gradient is correct
-        scaled_loss = loss / accum_steps
-
-        pred = Beta(alpha, beta).mean
+    # Beta.log_prob uses lgamma/log/pow — must be fp32 (fp16 causes spikes)
+    loss = beta_nll_loss(alpha, beta, labels.cuda())
+    scaled_loss = loss / accum_steps
 
     scaler.scale(scaled_loss).backward()
+
+    with torch.no_grad():
+        pred = Beta(alpha, beta).mean
 
     result = {"loss": np.exp(loss.item())}
     return result, pred
