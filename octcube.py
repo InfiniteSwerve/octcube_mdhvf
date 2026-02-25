@@ -1683,8 +1683,8 @@ class AttentionPool(nn.Module):
         self.attn = nn.Linear(dim, 1)
         if init == "mean":
             # Zero weights → attn(x) ≈ 0 for all tokens → softmax = 1/N → mean pool.
-            # Small noise breaks symmetry so gradients aren't identical.
-            nn.init.normal_(self.attn.weight, mean=0.0, std=1e-4)
+            # Patch tokens are all different so gradients are already diverse.
+            nn.init.zeros_(self.attn.weight)
             nn.init.zeros_(self.attn.bias)
 
     @beartype
