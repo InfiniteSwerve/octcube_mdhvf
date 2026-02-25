@@ -51,8 +51,9 @@ class TrainConfig:
     num_frames: int = 48
     t_patch_size: int = 3
     model_size: str = 'large'
-    batch_size = 1
-    num_workers = 25
+    phase1_batch_size: int = 2   # Larger batch OK — encoder frozen, no activation storage
+    phase2_batch_size: int = 1   # Encoder unfrozen, 24 blocks of activations tracked
+    num_workers: int = 25
 
     # Paths
     checkpoint_path: Optional[str] = '/storage2/fs1/leeay/Active/jstrand/projects/OCTCubeM/ckpt/OCTCube.pth'  # Path to OCTCube pretrained encoder weights
@@ -456,18 +457,15 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split):
 
 
 
-def full_supervised_run():
-    """Two-phase training: head-only then end-to-end with encoder warmup."""
-    os.makedirs("selected_images", exist_ok=True)
-    os.makedirs(TrainConfig.save_dir, exist_ok=True)
-
+def make_loaders(batch_size):
+    """Create train/val DataLoaders with the given batch size."""
     train_loader = torch.utils.data.DataLoader(
         HVFDataset(
             split_label="train",
             target_size=(TrainConfig.img_size, TrainConfig.img_size),
             normalize=True
         ),
-        batch_size=TrainConfig.batch_size,
+        batch_size=batch_size,
         num_workers=TrainConfig.num_workers,
     )
     val_loader = torch.utils.data.DataLoader(
@@ -476,10 +474,16 @@ def full_supervised_run():
             target_size=(TrainConfig.img_size, TrainConfig.img_size),
             normalize=True
         ),
-        batch_size=TrainConfig.batch_size,
+        batch_size=batch_size,
         num_workers=TrainConfig.num_workers,
     )
-    print("Loaded data loaders")
+    return train_loader, val_loader
+
+
+def full_supervised_run():
+    """Two-phase training: head-only then end-to-end with encoder warmup."""
+    os.makedirs("selected_images", exist_ok=True)
+    os.makedirs(TrainConfig.save_dir, exist_ok=True)
 
     # Create model with encoder FROZEN for phase 1
     model = OCTCubeRegression(
@@ -502,8 +506,10 @@ def full_supervised_run():
     # Phase 1: Train head only (encoder frozen)
     # ----------------------------------------------------------------
     print("=" * 60)
-    print(f"Phase 1: Training head only for {TrainConfig.phase1_epochs} epochs")
+    print(f"Phase 1: Training head only for {TrainConfig.phase1_epochs} epochs (batch_size={TrainConfig.phase1_batch_size})")
     print("=" * 60)
+
+    train_loader, val_loader = make_loaders(TrainConfig.phase1_batch_size)
 
     optimizer = torch.optim.AdamW(
         model.head.parameters(),
@@ -526,9 +532,11 @@ def full_supervised_run():
     # Phase 2: End-to-end fine-tuning (encoder unfrozen + LR warmup)
     # ----------------------------------------------------------------
     print("=" * 60)
-    print(f"Phase 2: End-to-end fine-tuning for {TrainConfig.phase2_epochs} epochs")
+    print(f"Phase 2: End-to-end fine-tuning for {TrainConfig.phase2_epochs} epochs (batch_size={TrainConfig.phase2_batch_size})")
     print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
     print("=" * 60)
+
+    train_loader, val_loader = make_loaders(TrainConfig.phase2_batch_size)
 
     # Unfreeze encoder
     for p in model.encoder.parameters():
