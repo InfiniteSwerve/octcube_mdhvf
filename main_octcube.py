@@ -101,10 +101,14 @@ class Metrics:
         gts = torch.cat(list(self.rolling_gts))
         mae = (preds - gts).abs().mean().item()
         r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item()
+
+        # R² = 1 - SS_res / SS_tot
+        ss_res = ((preds - gts) ** 2).sum().item()
+        ss_tot = ((gts - gts.mean()) ** 2).sum().item()
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
         preds_np = preds.numpy()
         gts_np = gts.numpy()
-        lo = min(preds_np.min(), gts_np.min())
-        hi = max(preds_np.max(), gts_np.max())
         plt.scatter(gts_np, preds_np, alpha=0.5)
         plt.plot([0, 1], [0, 1], 'r--')
         plt.xlabel('GT')
@@ -112,8 +116,7 @@ class Metrics:
         plt.savefig("regression_scatter.png")
         plt.close()
 
-
-        return {"mae": mae, "pearson_r": r}
+        return {"mae": mae, "pearson_r": r, "r2": r2}
 
     def print_latest(self, splits=None):
         if splits is None:
