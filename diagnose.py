@@ -377,6 +377,175 @@ def scaling_curve(strategies=None, n_points=6):
 
 # ── Step 3: Compare pooling strategies ──────────────────────────────
 
+def model_scaling_curve(strategy='mean_raw', n_points=6, skip_gbt_above=10000):
+    """Scaling curve comparing Ridge, ElasticNet, MLP, and GBT on one feature set.
+
+    Args:
+        strategy: Which pooling features to use (default: mean_raw).
+        n_points: Number of geometrically-spaced training sizes.
+        skip_gbt_above: Skip GBT for training sizes above this (it's slow).
+            Set to None to always run GBT.
+    """
+    from sklearn.linear_model import Ridge, ElasticNet
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import make_pipeline
+    from sklearn.metrics import r2_score
+    import torch
+    import torch.nn as nn_module
+    from torch.utils.data import TensorDataset, DataLoader
+    import time
+
+    out_dir = Path("extracted_features")
+    X_train_full = np.load(out_dir / f"{strategy}_train.npy")
+    y_train_full = np.load(out_dir / "labels_train.npy")
+    X_test = np.load(out_dir / f"{strategy}_test.npy")
+    y_test = np.load(out_dir / "labels_test.npy")
+
+    N = len(y_train_full)
+    sizes = np.unique(np.geomspace(50, N, n_points).astype(int))
+    sizes = [s for s in sizes if s <= N]
+
+    # Standardize using full train stats (so all sizes use same transform)
+    mean = X_train_full.mean(axis=0)
+    std = X_train_full.std(axis=0) + 1e-8
+    X_train_normed = (X_train_full - mean) / std
+    X_test_normed = (X_test - mean) / std
+
+    X_test_t = torch.tensor(X_test_normed, dtype=torch.float32)
+
+    def _train_mlp(X_np, y_np, in_dim, epochs=200):
+        """Train a small MLP, return test predictions."""
+        model = nn_module.Sequential(
+            nn_module.Linear(in_dim, 512),
+            nn_module.BatchNorm1d(512),
+            nn_module.ReLU(),
+            nn_module.Dropout(0.2),
+            nn_module.Linear(512, 128),
+            nn_module.BatchNorm1d(128),
+            nn_module.ReLU(),
+            nn_module.Dropout(0.2),
+            nn_module.Linear(128, 1),
+        )
+        ds = TensorDataset(
+            torch.tensor(X_np, dtype=torch.float32),
+            torch.tensor(y_np, dtype=torch.float32),
+        )
+        loader = DataLoader(ds, batch_size=min(64, len(X_np)), shuffle=True)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        loss_fn = nn_module.MSELoss()
+
+        model.train()
+        for _ in range(epochs):
+            for xb, yb in loader:
+                pred = model(xb).squeeze(-1)
+                loss = loss_fn(pred, yb)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+            sched.step()
+
+        model.eval()
+        with torch.no_grad():
+            return model(X_test_t).squeeze(-1).numpy()
+
+    print(f"Model scaling curve: strategy={strategy}")
+    print(f"Sizes: {sizes}")
+    print(f"Test set: {len(y_test)} samples")
+    if skip_gbt_above:
+        print(f"(Skipping GBT for N > {skip_gbt_above})")
+    print()
+
+    model_names = ['Ridge', 'ElasticNet', 'MLP', 'GBT']
+    results = {name: {} for name in model_names}
+
+    for n in sizes:
+        X_sub = X_train_normed[:n]
+        y_sub = y_train_full[:n]
+
+        t0 = time.time()
+
+        # Ridge
+        ridge = Ridge(alpha=1.0)
+        ridge.fit(X_sub, y_sub)
+        ridge_preds = ridge.predict(X_test_normed)
+        ridge_r2 = r2_score(y_test, ridge_preds)
+        ridge_mae = np.abs(y_test - ridge_preds).mean()
+        results['Ridge'][n] = {'r2': ridge_r2, 'mae': ridge_mae}
+
+        # ElasticNet
+        enet = ElasticNet(alpha=0.001, l1_ratio=0.5, max_iter=2000)
+        enet.fit(X_sub, y_sub)
+        enet_preds = enet.predict(X_test_normed)
+        enet_r2 = r2_score(y_test, enet_preds)
+        enet_mae = np.abs(y_test - enet_preds).mean()
+        results['ElasticNet'][n] = {'r2': enet_r2, 'mae': enet_mae}
+
+        # MLP
+        mlp_preds = _train_mlp(X_sub, y_sub, X_sub.shape[1])
+        mlp_r2 = r2_score(y_test, mlp_preds)
+        mlp_mae = np.abs(y_test - mlp_preds).mean()
+        results['MLP'][n] = {'r2': mlp_r2, 'mae': mlp_mae}
+
+        # GBT (skip if too slow)
+        if skip_gbt_above is None or n <= skip_gbt_above:
+            # Use raw (unstandardized) features for GBT — trees don't need scaling
+            X_sub_raw = X_train_full[:n]
+            pipe_gbt = make_pipeline(
+                StandardScaler(),
+                GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42)
+            )
+            pipe_gbt.fit(X_sub_raw, y_sub)
+            gbt_preds = pipe_gbt.predict(X_test)
+            gbt_r2 = r2_score(y_test, gbt_preds)
+            gbt_mae = np.abs(y_test - gbt_preds).mean()
+            results['GBT'][n] = {'r2': gbt_r2, 'mae': gbt_mae}
+            gbt_str = f"GBT R²={gbt_r2:.4f} MAE={gbt_mae:.4f}"
+        else:
+            gbt_str = "GBT skipped"
+
+        elapsed = time.time() - t0
+        print(f"  N={n:>6d}  Ridge R²={ridge_r2:.4f}  ENet R²={enet_r2:.4f}  "
+              f"MLP R²={mlp_r2:.4f}  {gbt_str}  ({elapsed:.1f}s)")
+
+    print()
+
+    # ── Plot ──
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    colors = {'Ridge': '#1f77b4', 'ElasticNet': '#ff7f0e', 'MLP': '#2ca02c', 'GBT': '#d62728'}
+
+    for name in model_names:
+        if not results[name]:
+            continue
+        ns = sorted(results[name].keys())
+        r2s = [results[name][n]['r2'] for n in ns]
+        maes = [results[name][n]['mae'] for n in ns]
+        axes[0].plot(ns, r2s, 'o-', label=name, color=colors[name], markersize=6)
+        axes[1].plot(ns, maes, 'o-', label=name, color=colors[name], markersize=6)
+
+    axes[0].set_xlabel('Training set size (N)')
+    axes[0].set_ylabel('Test R²')
+    axes[0].set_title(f'Model comparison: R² vs N ({strategy})')
+    axes[0].set_xscale('log')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    axes[0].axhline(0, color='gray', linestyle='--', linewidth=0.5)
+
+    axes[1].set_xlabel('Training set size (N)')
+    axes[1].set_ylabel('Test MAE')
+    axes[1].set_title(f'Model comparison: MAE vs N ({strategy})')
+    axes[1].set_xscale('log')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('model_scaling_curve.png', dpi=150)
+    plt.close()
+    print(f"Saved model_scaling_curve.png")
+
+
 def compare_pooling_strategies():
     """Train Ridge/GBT on train set, evaluate on held-out test set."""
     from sklearn.linear_model import Ridge
@@ -768,6 +937,10 @@ if __name__ == "__main__":
         compare_pooling_strategies()
     elif cmd == "scaling":
         scaling_curve()
+    elif cmd == "model_scaling":
+        strategy = sys.argv[2] if len(sys.argv) > 2 else "mean_raw"
+        skip = int(sys.argv[3]) if len(sys.argv) > 3 else 10000
+        model_scaling_curve(strategy=strategy, skip_gbt_above=skip)
     elif cmd == "mlp":
         strategy = sys.argv[2] if len(sys.argv) > 2 else "mean_raw"
         train_mlp_on_features(strategy=strategy)
@@ -789,7 +962,10 @@ if __name__ == "__main__":
         print("    Example: python diagnose.py extract None 4 4  # all data, bs=4, 4 GPUs")
         print()
         print("  python diagnose.py compare     # Ridge/GBT on extracted features")
-        print("  python diagnose.py scaling     # R² vs N scaling curve")
+        print("  python diagnose.py scaling     # R² vs N scaling curve (by pooling strategy)")
+        print("  python diagnose.py model_scaling [strategy] [skip_gbt_above]")
+        print("    Compare Ridge/ElasticNet/MLP/GBT scaling on one feature set.")
+        print("    Example: python diagnose.py model_scaling mean_raw 10000")
         print("  python diagnose.py mlp [strategy]")
         print("  python diagnose.py overfit [strategy] [n_samples]")
         print("=" * 60)
