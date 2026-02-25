@@ -459,10 +459,13 @@ def model_scaling_curve(strategy='mean_raw', n_points=6, skip_gbt_above=10000):
 
     model_names = ['Ridge', 'ElasticNet', 'MLP', 'GBT']
     results = {name: {} for name in model_names}
+    # Store test predictions at max N for scatter plots
+    full_preds = {}
 
     for n in sizes:
         X_sub = X_train_normed[:n]
         y_sub = y_train_full[:n]
+        is_max_n = (n == sizes[-1])
 
         t0 = time.time()
 
@@ -473,6 +476,8 @@ def model_scaling_curve(strategy='mean_raw', n_points=6, skip_gbt_above=10000):
         ridge_r2 = r2_score(y_test, ridge_preds)
         ridge_mae = np.abs(y_test - ridge_preds).mean()
         results['Ridge'][n] = {'r2': ridge_r2, 'mae': ridge_mae}
+        if is_max_n:
+            full_preds['Ridge'] = ridge_preds
 
         # ElasticNet
         enet = ElasticNet(alpha=0.001, l1_ratio=0.5, max_iter=2000)
@@ -481,12 +486,16 @@ def model_scaling_curve(strategy='mean_raw', n_points=6, skip_gbt_above=10000):
         enet_r2 = r2_score(y_test, enet_preds)
         enet_mae = np.abs(y_test - enet_preds).mean()
         results['ElasticNet'][n] = {'r2': enet_r2, 'mae': enet_mae}
+        if is_max_n:
+            full_preds['ElasticNet'] = enet_preds
 
         # MLP
         mlp_preds = _train_mlp(X_sub, y_sub, X_sub.shape[1])
         mlp_r2 = r2_score(y_test, mlp_preds)
         mlp_mae = np.abs(y_test - mlp_preds).mean()
         results['MLP'][n] = {'r2': mlp_r2, 'mae': mlp_mae}
+        if is_max_n:
+            full_preds['MLP'] = mlp_preds
 
         # GBT (skip if too slow)
         if skip_gbt_above is None or n <= skip_gbt_above:
@@ -502,6 +511,9 @@ def model_scaling_curve(strategy='mean_raw', n_points=6, skip_gbt_above=10000):
             gbt_mae = np.abs(y_test - gbt_preds).mean()
             results['GBT'][n] = {'r2': gbt_r2, 'mae': gbt_mae}
             gbt_str = f"GBT R²={gbt_r2:.4f} MAE={gbt_mae:.4f}"
+            if is_max_n or (skip_gbt_above is not None and n == max(
+                    s for s in sizes if s <= skip_gbt_above)):
+                full_preds['GBT'] = gbt_preds
         else:
             gbt_str = "GBT skipped"
 
@@ -511,7 +523,7 @@ def model_scaling_curve(strategy='mean_raw', n_points=6, skip_gbt_above=10000):
 
     print()
 
-    # ── Plot ──
+    # ── Scaling curve plot ──
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     colors = {'Ridge': '#1f77b4', 'ElasticNet': '#ff7f0e', 'MLP': '#2ca02c', 'GBT': '#d62728'}
@@ -544,6 +556,48 @@ def model_scaling_curve(strategy='mean_raw', n_points=6, skip_gbt_above=10000):
     plt.savefig('model_scaling_curve.png', dpi=150)
     plt.close()
     print(f"Saved model_scaling_curve.png")
+
+    # ── Pred vs GT heatmap scatters for full-N models ──
+    n_models = len(full_preds)
+    if n_models == 0:
+        return
+
+    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 5), squeeze=False)
+    axes = axes[0]
+
+    for idx, (name, preds) in enumerate(sorted(full_preds.items())):
+        ax = axes[idx]
+        r2 = r2_score(y_test, preds)
+        mae = np.abs(y_test - preds).mean()
+
+        # 2D histogram heatmap — handles density better than scatter at large N
+        vmin = min(y_test.min(), preds.min())
+        vmax = max(y_test.max(), preds.max())
+        bins = np.linspace(vmin, vmax, 60)
+        h, xedges, yedges = np.histogram2d(y_test, preds, bins=bins)
+        # Log scale for counts so sparse regions are still visible
+        h_log = np.log1p(h)
+        ax.imshow(h_log.T, origin='lower', aspect='auto',
+                  extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                  cmap='viridis')
+        ax.plot([vmin, vmax], [vmin, vmax], 'r--', linewidth=1.5, label='y=x')
+
+        # Find which N this came from
+        if name in results and results[name]:
+            pred_n = max(results[name].keys())
+            n_label = f"N={pred_n:,}"
+        else:
+            n_label = ""
+
+        ax.set_xlabel('Ground Truth')
+        ax.set_ylabel('Predicted')
+        ax.set_title(f'{name} ({n_label})\nR²={r2:.4f}  MAE={mae:.4f}')
+        ax.legend(loc='upper left', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig('model_pred_vs_gt.png', dpi=150)
+    plt.close()
+    print(f"Saved model_pred_vs_gt.png")
 
 
 def compare_pooling_strategies():
