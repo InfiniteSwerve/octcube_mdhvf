@@ -43,6 +43,7 @@ class TrainConfig:
     phase2_epochs: int = 15   # End-to-end (encoder unfrozen with warmup)
     encoder_lr: float = 1e-5
     head_lr: float = 1e-3
+    phase2_head_lr: float = 1e-4  # Lower LR for head MLP in phase 2 (already pretrained)
     warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
     grad_accum_steps: int = 4  # Gradient accumulation steps (effective batch = batch_size * accum)
 
@@ -274,19 +275,25 @@ def load_checkpoint(model, optimizer, scaler, metrics, path):
     return True
 
 def get_warmup_scheduler(optimizer, warmup_steps):
-    """Linear warmup for encoder (param group 0), constant LR for head (param group 1)."""
-    def lr_lambda_encoder(step):
+    """Linear warmup for encoder/pool (groups 0-1), constant for head MLP (group 2).
+
+    Three param groups expected:
+      0 = LoRA adapter params  (warmup from 0)
+      1 = AttentionPool params (warmup from 0 — random init, never saw data in phase 1)
+      2 = Head MLP params      (constant — already pretrained in phase 1)
+    """
+    def lr_lambda_warmup(step):
         if warmup_steps == 0:
             return 1.0
         if step < warmup_steps:
             return step / warmup_steps
         return 1.0
 
-    def lr_lambda_head(step):
+    def lr_lambda_constant(step):
         return 1.0
 
     return torch.optim.lr_scheduler.LambdaLR(
-        optimizer, [lr_lambda_encoder, lr_lambda_head]
+        optimizer, [lr_lambda_warmup, lr_lambda_warmup, lr_lambda_constant]
     )
 
 
@@ -600,11 +607,16 @@ def full_supervised_run():
     scaler = GradScaler("cuda")
     train_loader, val_loader = make_loaders(TrainConfig.phase1_batch_size)
 
-    # Collect only trainable params: LoRA adapters + head
+    # Collect only trainable params: LoRA adapters + pool + head MLP
+    # AttentionPool was never trained in phase 1 (features were pre-pooled),
+    # so it needs warmup just like the LoRA adapters.
     lora_adapter_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    pool_params = list(model.head.pool.parameters())
+    mlp_params = list(model.head.mlp.parameters())
     optimizer = torch.optim.AdamW([
         {"params": lora_adapter_params, "lr": TrainConfig.encoder_lr},
-        {"params": model.head.parameters(), "lr": TrainConfig.head_lr},
+        {"params": pool_params, "lr": TrainConfig.head_lr},
+        {"params": mlp_params, "lr": TrainConfig.phase2_head_lr},
     ])
 
     # Warmup scheduler for LoRA adapter LR
