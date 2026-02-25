@@ -37,7 +37,13 @@ class TrainConfig:
     partial_val_interval: int = 500
     train_save_im: int = 30
     plot_losses: int = 30
-    epochs: int = 20
+
+    # Two-phase training
+    phase1_epochs: int = 5    # Head-only (encoder frozen)
+    phase2_epochs: int = 15   # End-to-end (encoder unfrozen with warmup)
+    encoder_lr: float = 1e-5
+    head_lr: float = 1e-3
+    warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
 
     # Model parameters
     img_size: int = 512
@@ -198,8 +204,8 @@ class Metrics:
         return None
 
 
-def save_checkpoint(model, optimizer, scaler, metrics, path, is_best=False):
-    """Save training checkpoint."""
+def save_checkpoint(model, optimizer, scaler, metrics, path, is_best=False, save_encoder=False):
+    """Save training checkpoint. Optionally saves encoder state for phase 2."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     checkpoint = {
         "head_state_dict": model.head.state_dict(),
@@ -218,12 +224,14 @@ def save_checkpoint(model, optimizer, scaler, metrics, path, is_best=False):
         },
         "is_best": is_best,
     }
+    if save_encoder:
+        checkpoint["encoder_state_dict"] = model.encoder.state_dict()
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
 
 
 def load_checkpoint(model, optimizer, scaler, metrics, path):
-    """Load training checkpoint."""
+    """Load training checkpoint. Restores encoder state if present."""
     from collections import defaultdict
 
     if not os.path.exists(path):
@@ -233,6 +241,9 @@ def load_checkpoint(model, optimizer, scaler, metrics, path):
     checkpoint = torch.load(path, map_location="cuda", weights_only=False)
 
     model.head.load_state_dict(checkpoint["head_state_dict"])
+    if "encoder_state_dict" in checkpoint:
+        model.encoder.load_state_dict(checkpoint["encoder_state_dict"])
+        print("  Loaded encoder state from checkpoint")
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
@@ -249,11 +260,21 @@ def load_checkpoint(model, optimizer, scaler, metrics, path):
     print(f"Loaded checkpoint from {path} (epoch {metrics.current_epoch}, iter {metrics.current_iter})")
     return True
 
-def beta_nll_loss(alpha, beta, target):
-    target = target.clamp(1e-6, 1-1e-6)
-    dist = Beta(alpha, beta)
-    #print("mean: ", dist.mean.item(), " target: ", target.item())
-    return -dist.log_prob(target).mean()
+def get_warmup_scheduler(optimizer, warmup_steps):
+    """Linear warmup for encoder (param group 0), constant LR for head (param group 1)."""
+    def lr_lambda_encoder(step):
+        if warmup_steps == 0:
+            return 1.0
+        if step < warmup_steps:
+            return step / warmup_steps
+        return 1.0
+
+    def lr_lambda_head(step):
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, [lr_lambda_encoder, lr_lambda_head]
+    )
 
 
 def train_one_epoch(
@@ -263,6 +284,7 @@ def train_one_epoch(
     train_dataloader,
     val_dataloader,
     metrics: Metrics,
+    scheduler=None,
 ):
     """Training epoch - processes volumes in chunks."""
     model.train()
@@ -270,9 +292,6 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(train_dataloader):
         imgs = batch['frames']
         labels = batch['label']
-
-        # Accumulate metrics for this volume
-        volume_losses = []
 
         step_metrics, preds = one_training_step(
             imgs,
@@ -282,12 +301,13 @@ def train_one_epoch(
             scaler,
             metrics,
         )
+        if scheduler is not None:
+            scheduler.step()
+
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
         metrics.append("train", step_metrics)
 
-#        if metrics.should_run_validation_partial_epoch():
-#            validation_partial_epoch(model, val_dataloader, metrics, "val_partial")
         if metrics.should_plot_losses():
             metrics.plot_metrics()
 
@@ -437,7 +457,7 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split):
 
 
 def full_supervised_run():
-    """Main training function."""
+    """Two-phase training: head-only then end-to-end with encoder warmup."""
     os.makedirs("selected_images", exist_ok=True)
     os.makedirs(TrainConfig.save_dir, exist_ok=True)
 
@@ -459,76 +479,90 @@ def full_supervised_run():
         batch_size=TrainConfig.batch_size,
         num_workers=TrainConfig.num_workers,
     )
-    test_loader = torch.utils.data.DataLoader(
-        HVFDataset(
-            split_label="test",
-            target_size=(TrainConfig.img_size, TrainConfig.img_size),
-            normalize=True
-        ),
-        batch_size=TrainConfig.batch_size,
-        num_workers=TrainConfig.num_workers,
-    )
     print("Loaded data loaders")
 
+    # Create model with encoder FROZEN for phase 1
     model = OCTCubeRegression(
         img_size=TrainConfig.img_size,
         patch_size=TrainConfig.patch_size,
         num_frames=TrainConfig.num_frames,
         t_patch_size=TrainConfig.t_patch_size,
         size=TrainConfig.model_size,
-        freeze_encoder=False,
+        freeze_encoder=True,
         checkpoint_path=TrainConfig.checkpoint_path,
     ).cuda()
-    print("Initialized Model")
-
-#    optimizer = torch.optim.Adam(
-#        filter(lambda p: p.requires_grad, model.parameters()),
-#        lr=1e-3
-#    )
-    optimizer = torch.optim.AdamW([
-        {"params": model.encoder.parameters(), "lr": 1e-5},
-        {"params": model.head.parameters(), "lr": 1e-3},
-    ])
-    scaler = GradScaler("cuda")
-    print("Initialized Optimizer")
 
     metrics = Metrics()
-    print("Initialized Metrics")
-
-    # Resume from checkpoint if specified
-    start_epoch = 1
-    if TrainConfig.resume_from is not None:
-        if load_checkpoint(model, optimizer, scaler, metrics, TrainConfig.resume_from):
-            start_epoch = metrics.current_epoch + 1
-            # Load best dice from best checkpoint if it exists
-            best_path = os.path.join(TrainConfig.save_dir, "best.pt")
+    scaler = GradScaler("cuda")
 
     latest_path = os.path.join(TrainConfig.save_dir, "latest.pt")
-    best_path = os.path.join(TrainConfig.save_dir, "best.pt")
+    phase1_path = os.path.join(TrainConfig.save_dir, "phase1_final.pt")
 
-    for e in range(start_epoch, TrainConfig.epochs + 1):
+    # ----------------------------------------------------------------
+    # Phase 1: Train head only (encoder frozen)
+    # ----------------------------------------------------------------
+    print("=" * 60)
+    print(f"Phase 1: Training head only for {TrainConfig.phase1_epochs} epochs")
+    print("=" * 60)
+
+    optimizer = torch.optim.AdamW(
+        model.head.parameters(),
+        lr=TrainConfig.head_lr,
+    )
+
+    for e in range(1, TrainConfig.phase1_epochs + 1):
         metrics.current_epoch = e
-        print(f"Epoch: {e}")
+        print(f"Phase 1 - Epoch {e}/{TrainConfig.phase1_epochs}")
         train_one_epoch(
-            model,
-            optimizer,
-            scaler,
-            train_loader,
-            val_loader,
-            metrics,
+            model, optimizer, scaler,
+            train_loader, val_loader, metrics,
         )
-
-        #print("validation")
-        #validation_epoch(model, val_loader, metrics, "val")
-
-        # Save latest checkpoint
         save_checkpoint(model, optimizer, scaler, metrics, latest_path)
 
-    #print("testing")
-    #validation_epoch(model, test_loader, metrics, "test")
+    save_checkpoint(model, optimizer, scaler, metrics, phase1_path)
+    print(f"Phase 1 complete. Head checkpoint saved to {phase1_path}")
 
-    # Save final metrics and volume report
+    # ----------------------------------------------------------------
+    # Phase 2: End-to-end fine-tuning (encoder unfrozen + LR warmup)
+    # ----------------------------------------------------------------
+    print("=" * 60)
+    print(f"Phase 2: End-to-end fine-tuning for {TrainConfig.phase2_epochs} epochs")
+    print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
+    print("=" * 60)
+
+    # Unfreeze encoder
+    for p in model.encoder.parameters():
+        p.requires_grad = True
+    print("Encoder unfrozen")
+
+    # New optimizer with separate LRs
+    optimizer = torch.optim.AdamW([
+        {"params": model.encoder.parameters(), "lr": TrainConfig.encoder_lr},
+        {"params": model.head.parameters(), "lr": TrainConfig.head_lr},
+    ])
+    scaler = GradScaler("cuda")
+
+    # Warmup scheduler for encoder LR
+    total_phase2_steps = TrainConfig.phase2_epochs * len(train_loader)
+    warmup_steps = int(TrainConfig.warmup_fraction * total_phase2_steps)
+    scheduler = get_warmup_scheduler(optimizer, warmup_steps)
+    print(f"Warmup: {warmup_steps} steps out of {total_phase2_steps} total")
+
+    for e in range(1, TrainConfig.phase2_epochs + 1):
+        epoch_num = TrainConfig.phase1_epochs + e
+        metrics.current_epoch = epoch_num
+        print(f"Phase 2 - Epoch {e}/{TrainConfig.phase2_epochs} (overall {epoch_num})")
+        train_one_epoch(
+            model, optimizer, scaler,
+            train_loader, val_loader, metrics,
+            scheduler=scheduler,
+        )
+        save_checkpoint(model, optimizer, scaler, metrics, latest_path, save_encoder=True)
+
+    # Save final
     metrics.save(os.path.join(TrainConfig.save_dir, "metrics_final.json"))
+    metrics.plot_metrics()
+    print("Training complete.")
 
 
 if __name__ == "__main__":
