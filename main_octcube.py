@@ -327,6 +327,7 @@ def train_one_epoch(
     val_dataloader,
     metrics: Metrics,
     scheduler=None,
+    remaining_epochs: int = 1,
 ):
     """Training epoch with gradient accumulation."""
     model.train()
@@ -361,8 +362,13 @@ def train_one_epoch(
         # ETA calculation
         elapsed = time.time() - epoch_start
         steps_done = batch_idx + 1
-        eta_seconds = (elapsed / steps_done) * (total_batches - steps_done)
-        metrics.eta_str = f"{_format_time(elapsed)} elapsed, ETA {_format_time(eta_seconds)}"
+        secs_per_step = elapsed / steps_done
+        epoch_remaining = secs_per_step * (total_batches - steps_done)
+        total_remaining = epoch_remaining + secs_per_step * total_batches * (remaining_epochs - 1)
+        metrics.eta_str = (
+            f"batch {steps_done}/{total_batches} | "
+            f"{_format_time(elapsed)} elapsed, ETA {_format_time(total_remaining)}"
+        )
 
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
@@ -538,8 +544,14 @@ def phase1_on_features(metrics):
             # ETA
             elapsed = time.time() - epoch_start
             steps_done = batch_idx + 1
-            eta_seconds = (elapsed / steps_done) * (total_batches - steps_done)
-            metrics.eta_str = f"{_format_time(elapsed)} elapsed, ETA {_format_time(eta_seconds)}"
+            remaining_epochs = TrainConfig.phase1_epochs - e + 1
+            secs_per_step = elapsed / steps_done
+            epoch_remaining = secs_per_step * (total_batches - steps_done)
+            total_remaining = epoch_remaining + secs_per_step * total_batches * (remaining_epochs - 1)
+            metrics.eta_str = (
+                f"batch {steps_done}/{total_batches} | "
+                f"{_format_time(elapsed)} elapsed, ETA {_format_time(total_remaining)}"
+            )
 
             metrics.append("train", step_metrics)
 
@@ -666,6 +678,7 @@ def full_supervised_run():
             model, optimizer, scaler,
             train_loader, val_loader, metrics,
             scheduler=scheduler,
+            remaining_epochs=TrainConfig.phase2_epochs - e + 1,
         )
 
         # End-of-epoch validation + heatmap scatter
