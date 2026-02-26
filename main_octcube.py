@@ -403,7 +403,7 @@ def train_one_epoch(
 
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
-        step_metrics["grad_norm"] = last_grad_norm
+        step_metrics["grad_norm_preclip"] = last_grad_norm
         metrics.append("train", step_metrics)
 
         if metrics.should_plot_losses():
