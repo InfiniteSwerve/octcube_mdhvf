@@ -161,12 +161,16 @@ class Metrics:
         for ax, metric_name in zip(axes, sorted(all_metrics)):
             for split in ["train", "val", "val_partial", "test"]:
                 iters = self.data[split]["iterations"]
-                vals = self.data[split]["metrics"][metric_name]
-                if len(vals) > 0:
-                    if split == "train":
-                        ax.plot(iters, vals, alpha=0.7, label=split)
-                    else:
-                        ax.scatter(iters, vals, label=split, s=50, zorder=5)
+                vals = self.data[split]["metrics"].get(metric_name, [])
+                if len(vals) == 0:
+                    continue
+                # Metrics may start later than iterations (e.g. grad_norm only in phase 2).
+                # Use the last len(vals) iterations to align them.
+                plot_iters = iters[-len(vals):]
+                if split == "train":
+                    ax.plot(plot_iters, vals, alpha=0.7, label=split)
+                else:
+                    ax.scatter(plot_iters, vals, label=split, s=50, zorder=5)
             ax.set_ylabel(metric_name)
             if metric_name == "loss":
                 ax.set_yscale("log")
