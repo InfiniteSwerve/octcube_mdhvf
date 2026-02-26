@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 import torch.nn.functional as F
-from torch.distributions import Beta
 import numpy as np
 from dataset import HVFDataset, FeatureDataset
 import matplotlib.pyplot as plt
@@ -24,7 +23,7 @@ import shutil
 from collections import deque
 import tqdm
 
-from octcube import OCTCubeRegression, BetaRegressionHead, beta_nll_loss
+from octcube import OCTCubeRegression, SimpleRegressionHead
 
 typechecked = jaxtyped(typechecker=beartype)
 
@@ -339,38 +338,18 @@ def train_one_epoch(
 
     optimizer.zero_grad()
 
-    outlier_log_path = os.path.join(TrainConfig.save_dir, "loss_outliers.jsonl")
-    NLL_OUTLIER_THRESHOLD = 5.0  # Log samples with raw NLL above this
     last_grad_norm = 0.0
 
     for batch_idx, batch in enumerate(train_dataloader):
         imgs = batch['frames']
         labels = batch['label']
-        mrns = batch['mrn']
 
-        step_metrics, preds, alpha, beta_param, raw_nll = one_training_step(
+        step_metrics, preds = one_training_step(
             imgs,
             labels,
             model,
             accum,
         )
-
-        # Log outlier samples for investigation
-        for i in range(len(raw_nll)):
-            if raw_nll[i].item() > NLL_OUTLIER_THRESHOLD:
-                import json
-                entry = {
-                    "epoch": metrics.current_epoch,
-                    "iter": metrics.current_iter,
-                    "mrn": str(mrns[i]),
-                    "label_normalized": labels[i].item(),
-                    "alpha": alpha[i].item(),
-                    "beta": beta_param[i].item(),
-                    "predicted_mean": (alpha[i] / (alpha[i] + beta_param[i])).item(),
-                    "raw_nll": raw_nll[i].item(),
-                }
-                with open(outlier_log_path, "a") as f:
-                    f.write(json.dumps(entry) + "\n")
 
         # Optimizer step on accumulation boundary
         if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches:
@@ -395,8 +374,6 @@ def train_one_epoch(
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
         step_metrics["grad_norm_preclip"] = last_grad_norm
-        step_metrics["alpha"] = alpha.mean().item()
-        step_metrics["beta"] = beta_param.mean().item()
         if hasattr(model, 'get_last_block_entropy'):
             ent = model.get_last_block_entropy()
             if ent is not None:
@@ -417,23 +394,17 @@ def one_training_step(
     labels: Float[Tensor, "batches"],
     model: nn.Module,
     accum_steps: int,
-) -> tuple[dict[str, float], Tensor, Float[Tensor, "batches"], Float[Tensor, "batches"], Float[Tensor, "batches"]]:
+) -> tuple[dict[str, float], Tensor]:
     """Single micro-step: forward + backward (no optimizer step).
-    Returns (metrics, preds, alpha, beta, raw_nll) for diagnostics."""
-    logits = model(images.cuda())
-    alpha = logits[0].float()
-    beta = logits[1].float()
-
-    loss, per_sample_nll = beta_nll_loss(alpha, beta, labels.cuda())
+    Returns (metrics, preds) for diagnostics."""
+    pred = model(images.cuda()).float()
+    loss = F.mse_loss(pred, labels.cuda())
     scaled_loss = loss / accum_steps
 
     scaled_loss.backward()
 
-    with torch.no_grad():
-        pred = Beta(alpha, beta).mean
-
-    result = {"loss": np.exp(loss.item())}
-    return result, pred, alpha.detach(), beta.detach(), per_sample_nll
+    result = {"loss": loss.item()}
+    return result, pred.detach()
 
 
 def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_partial", max_vols=None):
@@ -458,12 +429,8 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
             imgs = batch['frames'].cuda()
             labels = batch['label'].cuda()
 
-            logits = model(imgs)
-            alpha = logits[0].float()
-            beta_val = logits[1].float()
-
-            loss, _ = beta_nll_loss(alpha, beta_val, labels)
-            pred = Beta(alpha, beta_val).mean
+            pred = model(imgs).float()
+            loss = F.mse_loss(pred, labels)
 
             total_loss += loss.item()
             all_preds.append(pred.cpu())
@@ -482,7 +449,7 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
     val_metrics = {
-        "loss": np.exp(avg_loss),
+        "loss": avg_loss,
         "mae": mae,
         "pearson_r": r,
         "r2": r2,
@@ -532,7 +499,7 @@ def phase1_on_features(metrics):
     )
 
     embed_dim = 1024 if TrainConfig.model_size == 'large' else 768
-    head = BetaRegressionHead(in_features=embed_dim, hidden_dim=256).cuda()
+    head = SimpleRegressionHead(in_features=embed_dim, hidden_dim=256).cuda()
 
     optimizer = torch.optim.AdamW(head.parameters(), lr=TrainConfig.head_lr)
 
@@ -552,16 +519,14 @@ def phase1_on_features(metrics):
             feats = batch["features"].cuda()
             labels = batch["label"].cuda()
 
-            alpha, beta = head(feats)  # (B, D) -> head skips AttentionPool
-            loss, _ = beta_nll_loss(alpha, beta, labels)
+            pred = head(feats)  # (B, D) -> head skips AttentionPool
+            loss = F.mse_loss(pred, labels)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-            pred = Beta(alpha, beta).mean
             metrics.append_regression(pred, batch["label"])
-            step_metrics = {"loss": np.exp(loss.item())}
+            step_metrics = {"loss": loss.item()}
             step_metrics.update(metrics.get_regression_metrics())
 
             # ETA
@@ -586,9 +551,8 @@ def phase1_on_features(metrics):
             for batch in val_loader:
                 feats = batch["features"].cuda()
                 labels = batch["label"].cuda()
-                alpha, beta = head(feats)
-                loss, _ = beta_nll_loss(alpha, beta, labels)
-                pred = Beta(alpha, beta).mean
+                pred = head(feats)
+                loss = F.mse_loss(pred, labels)
                 total_loss += loss.item()
                 all_preds.append(pred.cpu())
                 all_labels.append(batch["label"])
@@ -602,7 +566,7 @@ def phase1_on_features(metrics):
         ss_tot = ((gts - gts.mean()) ** 2).sum().item()
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
-        val_metrics = {"loss": np.exp(avg_loss), "mae": mae, "pearson_r": r, "r2": r2}
+        val_metrics = {"loss": avg_loss, "mae": mae, "pearson_r": r, "r2": r2}
         metrics.append("val", val_metrics)
 
         # Heatmap scatter for this epoch

@@ -17,7 +17,6 @@ import warnings
 import torch
 from torch import nn
 from torch import Tensor
-from torch.distributions import Beta
 import torch.nn.functional as F
 from einops import rearrange, repeat
 import numpy as np
@@ -1707,7 +1706,7 @@ class OCTCubeSegmenter(nn.Module):
         return logits
 
 ########################################################################
-# Beta distribution based regression head
+# Regression head
 
 class AttentionPool(nn.Module):
     def __init__(self, dim: int, init: str = "mean"):
@@ -1727,7 +1726,7 @@ class AttentionPool(nn.Module):
         return (w * x).sum(dim=1)
 
 
-class BetaRegressionHead(nn.Module):
+class SimpleRegressionHead(nn.Module):
     def __init__(self, in_features: int, hidden_dim: int = 256):
         super().__init__()
         self.pool = AttentionPool(in_features)
@@ -1735,42 +1734,24 @@ class BetaRegressionHead(nn.Module):
             nn.Linear(in_features, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 2),
-            nn.Softplus(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
         )
 
     @beartype
     def forward(
         self, x: Float[Tensor, "B N D"] | Float[Tensor, "B D"]
-    ) -> tuple[Float[Tensor, "B"], Float[Tensor, "B"]]:
+    ) -> Float[Tensor, "B"]:
         if x.dim() == 2:
             pooled = x  # Already pooled
         else:
             pooled = self.pool(x)
-        ab: Float[Tensor, "B 2"] = self.mlp(pooled).clamp(max=50) + 1e-6
-        alpha: Float[Tensor, "B"] = ab[:, 0]
-        beta: Float[Tensor, "B"] = ab[:, 1]
-        return alpha, beta
-
-
-@beartype
-def beta_nll_loss(
-    alpha: Float[Tensor, "B"],
-    beta: Float[Tensor, "B"],
-    target: Float[Tensor, "B"],
-    max_nll: float = 10.0,
-) -> tuple[Float[Tensor, ""], Float[Tensor, "B"]]:
-    """Returns (clipped mean loss, raw per-sample NLL for diagnostics)."""
-    target = target.clamp(1e-6, 1 - 1e-6)
-    dist = Beta(alpha, beta)
-    per_sample_raw = -dist.log_prob(target)
-    per_sample_clipped = per_sample_raw.clamp(max=max_nll)
-    return per_sample_clipped.mean(), per_sample_raw.detach()
+        return self.mlp(pooled).squeeze(-1)
 
 class OCTCubeRegression(nn.Module):
     """
-    OCTCube encoder + beta distribution regression head.
-    Predicts a per-volume Beta(α, β) distribution over a bounded [0, 1] target.
+    OCTCube encoder + regression head.
+    Predicts a per-volume scalar in [0, 1] via Sigmoid.
     """
 
     def __init__(
@@ -1806,7 +1787,7 @@ class OCTCubeRegression(nn.Module):
                 p.requires_grad = False
             print("Encoder weights frozen")
 
-        self.head = BetaRegressionHead(
+        self.head = SimpleRegressionHead(
             in_features=self.encoder.embed_dim,
             hidden_dim=256,
         )
@@ -1814,12 +1795,12 @@ class OCTCubeRegression(nn.Module):
     @beartype
     def forward(
         self, x: Float[Tensor, "B C T H W"] | Float[Tensor, "B T H W"],
-    ) -> tuple[Float[Tensor, "B"], Float[Tensor, "B"]]:
+    ) -> Float[Tensor, "B"]:
         """
         Args:
             x: OCT volume, (B, C, T, H, W) or (B, T, H, W)
         Returns:
-            (alpha, beta) each of shape (B,)
+            pred: shape (B,), values in [0, 1]
         """
         if x.dim() == 4:
             x: Float[Tensor, "B 1 T H W"] = x.unsqueeze(1)
@@ -1831,8 +1812,7 @@ class OCTCubeRegression(nn.Module):
         tokens: Float[Tensor, "B Tp L D"] = self.encoder(x, return_all_tokens=True)
         tokens: Float[Tensor, "B N D"] = tokens.flatten(1, 2)
 
-        alpha, beta = self.head(tokens)
-        return alpha, beta
+        return self.head(tokens)
 
     def enable_entropy(self, enable: bool = True):
         """Toggle attention entropy computation on the last encoder block."""
@@ -1894,8 +1874,7 @@ if __name__ == "__main__":
     print(f"Input shape: {x.shape}")
 
     with torch.no_grad():
-        alpha, beta = model(x)
+        pred = model(x)
 
-    print(f"alpha shape: {alpha.shape}")
-    print(f"beta shape: {beta.shape}")
+    print(f"pred shape: {pred.shape}")
     print(f"Expected: ({B})")

@@ -1,11 +1,11 @@
-"""Evaluate how sensitive the BetaRegressionHead is to Gaussian noise on encoder features.
+"""Evaluate how sensitive the SimpleRegressionHead is to Gaussian noise on encoder features.
 
-Loads phase1_head.pt and the pre-extracted features, adds N(0, sigma^2) noise
-for a range of sigma values, and plots how alpha and beta change.
+Loads phase1_head.pt and the pre-extracted features, adds noise with ||noise||_2 = sigma
+for a range of sigma values, and plots how predictions change.
 
 Produces two plots:
-  1. Mean alpha and beta vs sigma
-  2. Relative change in alpha and beta vs sigma (% change from sigma=0 baseline)
+  1. Mean prediction vs sigma
+  2. Relative change in prediction vs sigma (% change from sigma=0 baseline)
 
 Usage:
     python noise_sensitivity.py
@@ -14,7 +14,7 @@ Usage:
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from octcube import BetaRegressionHead
+from octcube import SimpleRegressionHead
 
 # ---------------------------------------------------------------------------
 # Config — matches main_octcube.py TrainConfig defaults
@@ -33,7 +33,7 @@ SIGMAS = np.unique(np.round(SIGMAS, 2))
 def main():
     # Load head
     head_path = f"{SAVE_DIR}/phase1_head.pt"
-    head = BetaRegressionHead(in_features=EMBED_DIM, hidden_dim=256).cuda()
+    head = SimpleRegressionHead(in_features=EMBED_DIM, hidden_dim=256).cuda()
     head.load_state_dict(torch.load(head_path, map_location="cuda", weights_only=True))
     head.eval()
     print(f"Loaded head from {head_path}")
@@ -53,10 +53,8 @@ def main():
           f"min={feat_norms.min():.2f}, max={feat_norms.max():.2f}")
 
     # Run noisy evaluation
-    mean_alphas = []
-    mean_betas = []
-    std_alphas = []
-    std_betas = []
+    mean_preds = []
+    std_preds = []
 
     with torch.no_grad():
         for sigma in SIGMAS:
@@ -64,57 +62,44 @@ def main():
             noise = noise / noise.norm(dim=-1, keepdim=True) * sigma
             noisy_feats = feats + noise
 
-            alpha, beta = head(noisy_feats)  # (N,), (N,)
-            mean_alphas.append(alpha.mean().item())
-            mean_betas.append(beta.mean().item())
-            std_alphas.append(alpha.std().item())
-            std_betas.append(beta.std().item())
+            pred = head(noisy_feats)  # (N,)
+            mean_preds.append(pred.mean().item())
+            std_preds.append(pred.std().item())
 
             if sigma == 0 or sigma == SIGMAS[-1] or abs(sigma - 1.0) < 0.01:
-                pred_mean = (alpha / (alpha + beta)).mean().item()
-                print(f"  sigma={sigma:.3f}: alpha={alpha.mean():.4f}±{alpha.std():.4f}, "
-                      f"beta={beta.mean():.4f}±{beta.std():.4f}, "
-                      f"pred_mean={pred_mean:.4f}")
+                print(f"  sigma={sigma:.3f}: pred={pred.mean():.4f}±{pred.std():.4f}")
 
-    mean_alphas = np.array(mean_alphas)
-    mean_betas = np.array(mean_betas)
-    std_alphas = np.array(std_alphas)
-    std_betas = np.array(std_betas)
+    mean_preds = np.array(mean_preds)
+    std_preds = np.array(std_preds)
 
     # Baseline (sigma=0)
-    a0, b0 = mean_alphas[0], mean_betas[0]
+    p0 = mean_preds[0]
 
     # -----------------------------------------------------------------------
-    # Plot 1: Absolute alpha and beta vs sigma
+    # Plot 1: Absolute prediction vs sigma
     # -----------------------------------------------------------------------
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    ax1.plot(SIGMAS, mean_alphas, "o-", color="tab:blue", label="mean alpha", markersize=4)
-    ax1.fill_between(SIGMAS, mean_alphas - std_alphas, mean_alphas + std_alphas,
+    ax1.plot(SIGMAS, mean_preds, "o-", color="tab:blue", label="mean pred", markersize=4)
+    ax1.fill_between(SIGMAS, mean_preds - std_preds, mean_preds + std_preds,
                      alpha=0.2, color="tab:blue")
-    ax1.plot(SIGMAS, mean_betas, "s-", color="tab:orange", label="mean beta", markersize=4)
-    ax1.fill_between(SIGMAS, mean_betas - std_betas, mean_betas + std_betas,
-                     alpha=0.2, color="tab:orange")
-    ax1.set_xlabel("Noise σ")
-    ax1.set_ylabel("Parameter value")
-    ax1.set_title("BetaRegressionHead: α and β vs Gaussian noise σ")
+    ax1.set_xlabel("Noise σ (L2 norm)")
+    ax1.set_ylabel("Prediction")
+    ax1.set_title("SimpleRegressionHead: prediction vs Gaussian noise σ")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    ax1.axhline(a0, color="tab:blue", ls="--", alpha=0.4)
-    ax1.axhline(b0, color="tab:orange", ls="--", alpha=0.4)
+    ax1.axhline(p0, color="tab:blue", ls="--", alpha=0.4)
 
     # -----------------------------------------------------------------------
     # Plot 2: Relative change (%) from baseline
     # -----------------------------------------------------------------------
-    rel_alpha = (mean_alphas - a0) / (a0 + 1e-8) * 100
-    rel_beta = (mean_betas - b0) / (b0 + 1e-8) * 100
+    rel_pred = (mean_preds - p0) / (p0 + 1e-8) * 100
 
-    ax2.plot(SIGMAS, rel_alpha, "o-", color="tab:blue", label="Δα / α₀  (%)", markersize=4)
-    ax2.plot(SIGMAS, rel_beta, "s-", color="tab:orange", label="Δβ / β₀  (%)", markersize=4)
+    ax2.plot(SIGMAS, rel_pred, "o-", color="tab:blue", label="Δpred / pred₀  (%)", markersize=4)
     ax2.axhline(0, color="gray", ls="--", alpha=0.5)
-    ax2.set_xlabel("Noise σ")
+    ax2.set_xlabel("Noise σ (L2 norm)")
     ax2.set_ylabel("Relative change (%)")
-    ax2.set_title("Relative change in α and β from clean features")
+    ax2.set_title("Relative change in prediction from clean features")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
