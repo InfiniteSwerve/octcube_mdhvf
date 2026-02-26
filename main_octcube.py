@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler
 from torch.distributions import Beta
 import numpy as np
 from dataset import HVFDataset, FeatureDataset
@@ -246,13 +245,12 @@ def plot_pred_vs_gt_heatmap(preds_np, gts_np, epoch, save_dir="scatter_plots", t
     print(f"Saved heatmap scatter to {path}")
 
 
-def save_checkpoint(model, optimizer, scaler, metrics, path, is_best=False, save_encoder=False):
+def save_checkpoint(model, optimizer, metrics, path, is_best=False, save_encoder=False):
     """Save training checkpoint. Optionally saves encoder state for phase 2."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     checkpoint = {
         "head_state_dict": model.head.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
         "metrics": {
             "current_iter": metrics.current_iter,
             "current_epoch": metrics.current_epoch,
@@ -272,7 +270,7 @@ def save_checkpoint(model, optimizer, scaler, metrics, path, is_best=False, save
     print(f"Saved checkpoint to {path}")
 
 
-def load_checkpoint(model, optimizer, scaler, metrics, path):
+def load_checkpoint(model, optimizer, metrics, path):
     """Load training checkpoint. Restores encoder state if present."""
     from collections import defaultdict
 
@@ -287,7 +285,6 @@ def load_checkpoint(model, optimizer, scaler, metrics, path):
         model.encoder.load_state_dict(checkpoint["encoder_state_dict"])
         print("  Loaded encoder state from checkpoint")
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     # Restore metrics
     metrics_data = checkpoint["metrics"]
@@ -328,7 +325,6 @@ def get_warmup_scheduler(optimizer, warmup_steps):
 def train_one_epoch(
     model,
     optimizer,
-    scaler,
     train_dataloader,
     val_dataloader,
     metrics: Metrics,
@@ -356,7 +352,6 @@ def train_one_epoch(
             imgs,
             labels,
             model,
-            scaler,
             accum,
         )
 
@@ -379,11 +374,9 @@ def train_one_epoch(
 
         # Optimizer step on accumulation boundary
         if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches:
-            scaler.unscale_(optimizer)
             trainable = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
             last_grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=TrainConfig.max_grad_norm).item()
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
@@ -421,21 +414,18 @@ def one_training_step(
     images: Float[Tensor, "batches channels frames height width"],
     labels: Float[Tensor, "batches"],
     model: nn.Module,
-    scaler: GradScaler,
     accum_steps: int,
 ) -> tuple[dict[str, float], Tensor, Float[Tensor, "batches"], Float[Tensor, "batches"], Float[Tensor, "batches"]]:
-    """Single micro-step: forward + scaled backward (no optimizer step).
+    """Single micro-step: forward + backward (no optimizer step).
     Returns (metrics, preds, alpha, beta, raw_nll) for diagnostics."""
-    with torch.amp.autocast("cuda"):
-        logits = model(images.cuda())
-        alpha = logits[0].float()
-        beta = logits[1].float()
+    logits = model(images.cuda())
+    alpha = logits[0].float()
+    beta = logits[1].float()
 
-    # Beta.log_prob uses lgamma/log/pow — must be fp32 (fp16 causes spikes)
     loss, per_sample_nll = beta_nll_loss(alpha, beta, labels.cuda())
     scaled_loss = loss / accum_steps
 
-    scaler.scale(scaled_loss).backward()
+    scaled_loss.backward()
 
     with torch.no_grad():
         pred = Beta(alpha, beta).mean
@@ -466,10 +456,9 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
             imgs = batch['frames'].cuda()
             labels = batch['label'].cuda()
 
-            with torch.amp.autocast("cuda"):
-                logits = model(imgs)
-                alpha = logits[0].float()
-                beta_val = logits[1].float()
+            logits = model(imgs)
+            alpha = logits[0].float()
+            beta_val = logits[1].float()
 
             loss, _ = beta_nll_loss(alpha, beta_val, labels)
             pred = Beta(alpha, beta_val).mean
@@ -694,7 +683,6 @@ def full_supervised_run():
 
     model.enable_entropy(True)
 
-    scaler = GradScaler("cuda")
     train_loader, val_loader = make_loaders(TrainConfig.phase2_batch_size)
     pool_params = list(model.head.pool.parameters())
     mlp_params = list(model.head.mlp.parameters())
@@ -728,7 +716,7 @@ def full_supervised_run():
             metrics.current_epoch = epoch_num
             print(f"Phase 2a - Epoch {e}/{hf} (overall {epoch_num})  [head frozen]")
             train_one_epoch(
-                model, optimizer_2a, scaler,
+                model, optimizer_2a,
                 train_loader, val_loader, metrics,
                 scheduler=scheduler_2a,
                 remaining_epochs=TrainConfig.phase2_epochs - e + 1,
@@ -736,7 +724,7 @@ def full_supervised_run():
 
             preds, gts = validation_partial_epoch(model, val_loader, metrics, split="val")
             plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, "Phase 2a")
-            save_checkpoint(model, optimizer_2a, scaler, metrics, latest_path, save_encoder=True)
+            save_checkpoint(model, optimizer_2a, metrics, latest_path, save_encoder=True)
 
         # Unfreeze head
         for p in pool_params + mlp_params:
@@ -780,7 +768,7 @@ def full_supervised_run():
         phase_label = "Phase 2b" if hf > 0 else "Phase 2"
         print(f"{phase_label} - Epoch {e}/{remaining_epochs} (overall {epoch_num})")
         train_one_epoch(
-            model, optimizer, scaler,
+            model, optimizer,
             train_loader, val_loader, metrics,
             scheduler=scheduler,
             remaining_epochs=remaining_epochs - e + 1,
@@ -790,7 +778,7 @@ def full_supervised_run():
         preds, gts = validation_partial_epoch(model, val_loader, metrics, split="val")
         plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, phase_label)
 
-        save_checkpoint(model, optimizer, scaler, metrics, latest_path, save_encoder=True)
+        save_checkpoint(model, optimizer, metrics, latest_path, save_encoder=True)
 
     # Save final
     metrics.save(os.path.join(TrainConfig.save_dir, "metrics_final.json"))
