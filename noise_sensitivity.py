@@ -24,10 +24,10 @@ FEATURE_POOL = "mean_raw"
 SAVE_DIR = "checkpoints_octcube"
 EMBED_DIM = 1024  # 'large' model
 SIGMAS = np.concatenate([
-    np.linspace(0, 0.5, 11),   # fine resolution near 0
-    np.linspace(0.75, 3.0, 10),
+    np.linspace(0, 5, 11),     # fine resolution near 0
+    np.linspace(7.5, 50, 10),  # sigma is now ||noise||_2, comparable to feature norms
 ])
-SIGMAS = np.unique(np.round(SIGMAS, 4))
+SIGMAS = np.unique(np.round(SIGMAS, 2))
 
 
 def main():
@@ -60,7 +60,8 @@ def main():
 
     with torch.no_grad():
         for sigma in SIGMAS:
-            noise = torch.randn_like(feats) * sigma
+            noise = torch.randn_like(feats)
+            noise = noise / noise.norm(dim=-1, keepdim=True) * sigma
             noisy_feats = feats + noise
 
             alpha, beta = head(noisy_feats)  # (N,), (N,)
