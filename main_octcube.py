@@ -473,6 +473,7 @@ def make_loaders(batch_size):
             normalize=True
         ),
         batch_size=batch_size,
+        shuffle=True,
         num_workers=TrainConfig.num_workers,
     )
     val_loader = torch.utils.data.DataLoader(
@@ -649,12 +650,13 @@ def full_supervised_run():
     ])
 
     # Warmup scheduler for LoRA adapter LR
-    total_phase2_steps = TrainConfig.phase2_epochs * len(train_loader)
-    warmup_steps = int(TrainConfig.warmup_fraction * total_phase2_steps)
+    # Scheduler steps once per optimizer step (every grad_accum_steps batches)
+    total_optimizer_steps = (TrainConfig.phase2_epochs * len(train_loader)) // TrainConfig.grad_accum_steps
+    warmup_steps = int(TrainConfig.warmup_fraction * total_optimizer_steps)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # LambdaLR.__init__ calls step() before any optimizer.step()
         scheduler = get_warmup_scheduler(optimizer, warmup_steps)
-    print(f"Warmup: {warmup_steps} steps out of {total_phase2_steps} total")
+    print(f"Warmup: {warmup_steps} optimizer steps out of {total_optimizer_steps} total")
 
     for e in range(1, TrainConfig.phase2_epochs + 1):
         epoch_num = TrainConfig.phase1_epochs + e
