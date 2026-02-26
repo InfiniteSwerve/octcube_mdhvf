@@ -59,11 +59,12 @@ class TrainConfig:
     feature_pool: str = "mean_raw"  # Must match AttentionPool init (mean pool at start)
 
     # Model parameters
-    img_size: int = 512
+    img_size: int = 384         # Reduced from 512: 24x24=576 spatial patches (vs 32x32=1024)
     patch_size: int = 16
     num_frames: int = 48
     t_patch_size: int = 3
     model_size: str = 'large'
+    center_crop_frac: float = 0.5  # Crop to center 50% of W before resize (None to disable)
     phase1_batch_size: int = 2   # Also used for LoRA phase 2 (similar memory footprint)
     phase2_batch_size: int = 1   # Only needed if doing full fine-tuning (no LoRA)
     num_workers: int = 25
@@ -472,22 +473,19 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
 
 def make_loaders(batch_size):
     """Create train/val DataLoaders with the given batch size."""
+    dataset_kwargs = dict(
+        target_size=(TrainConfig.img_size, TrainConfig.img_size),
+        normalize=True,
+        center_crop_frac=TrainConfig.center_crop_frac,
+    )
     train_loader = torch.utils.data.DataLoader(
-        HVFDataset(
-            split_label="train",
-            target_size=(TrainConfig.img_size, TrainConfig.img_size),
-            normalize=True
-        ),
+        HVFDataset(split_label="train", **dataset_kwargs),
         batch_size=batch_size,
         shuffle=True,
         num_workers=TrainConfig.num_workers,
     )
     val_loader = torch.utils.data.DataLoader(
-        HVFDataset(
-            split_label="val",
-            target_size=(TrainConfig.img_size, TrainConfig.img_size),
-            normalize=True
-        ),
+        HVFDataset(split_label="val", **dataset_kwargs),
         batch_size=batch_size,
         num_workers=TrainConfig.num_workers,
     )
@@ -621,6 +619,12 @@ def full_supervised_run():
     print(f"Phase 2: LoRA fine-tuning for {TrainConfig.phase2_epochs} epochs")
     print(f"  LoRA rank={TrainConfig.lora_rank}, alpha={TrainConfig.lora_alpha}")
     print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
+    spatial_patches = (TrainConfig.img_size // TrainConfig.patch_size) ** 2
+    temporal_patches = TrainConfig.num_frames // TrainConfig.t_patch_size
+    total_tokens = spatial_patches * temporal_patches
+    print(f"  Tokens: {spatial_patches} spatial x {temporal_patches} temporal = {total_tokens:,}")
+    if TrainConfig.center_crop_frac is not None:
+        print(f"  Center crop: {TrainConfig.center_crop_frac:.0%} of W before resize")
     print("=" * 60)
 
     # Now create the full model (encoder + head)

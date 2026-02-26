@@ -13,13 +13,14 @@ from utils import load_config
 
 
 class HVFDataset(torch.utils.data.Dataset):
-    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula"):
+    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None):
         super().__init__()
-        
+
         self.cfg = load_config("config.json")
         self.split_label = split_label
         self.target_size = target_size
         self.normalize=normalize
+        self.center_crop_frac = center_crop_frac  # e.g. 0.5 keeps center 50% of W
 
         
         self.hvfmd_path = "macula_oct_partially_deduplicated.tsv" if anatomy == "macula" else "optic_nerve_oct_partially_deduplicated.tsv"
@@ -76,8 +77,15 @@ class HVFDataset(torch.utils.data.Dataset):
             self.dcm_path, row["img_fn"].lstrip("/")
         )
         im = torch.from_numpy(pydicom.dcmread(oct_path).pixel_array).to(torch.float)
-        orig_H, orig_W = im.shape[1], im.shape[2]
-        
+        # im shape: (frames, H, W)
+
+        # Center crop along W (left-right) before resize — keeps center of each B-scan
+        if self.center_crop_frac is not None:
+            W = im.shape[2]
+            crop_w = int(W * self.center_crop_frac)
+            start = (W - crop_w) // 2
+            im = im[:, :, start:start + crop_w]
+
         # Resize if needed
         if self.target_size is not None:
             target_H, target_W = self.target_size

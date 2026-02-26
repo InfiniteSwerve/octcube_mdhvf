@@ -1726,10 +1726,13 @@ def beta_nll_loss(
     alpha: Float[Tensor, "B"],
     beta: Float[Tensor, "B"],
     target: Float[Tensor, "B"],
+    max_nll: float = 10.0,
 ) -> Float[Tensor, ""]:
     target = target.clamp(1e-6, 1 - 1e-6)
     dist = Beta(alpha, beta)
-    return -dist.log_prob(target).mean()
+    per_sample = -dist.log_prob(target)
+    per_sample = per_sample.clamp(max=max_nll)
+    return per_sample.mean()
 
 class OCTCubeRegression(nn.Module):
     """
