@@ -685,6 +685,19 @@ class OCTCubeWrapper(nn.Module):
             self.num_frames, self.t_patch_size
         )
 
+        # Interpolate spatial pos embed for separate pos embed models
+        if 'pos_embed_spatial' in state_dict:
+            ckpt_spatial = state_dict['pos_embed_spatial']  # (1, L_old, D)
+            model_spatial = self.model.pos_embed_spatial     # (1, L_new, D)
+            if ckpt_spatial.shape[1] != model_spatial.shape[1]:
+                D = ckpt_spatial.shape[-1]
+                old_grid = int(ckpt_spatial.shape[1] ** 0.5)
+                new_grid = int(model_spatial.shape[1] ** 0.5)
+                print(f"Spatial pos_embed interpolate from {old_grid}x{old_grid} to {new_grid}x{new_grid}")
+                ckpt_spatial = ckpt_spatial.reshape(1, old_grid, old_grid, D).permute(0, 3, 1, 2)
+                ckpt_spatial = F.interpolate(ckpt_spatial, size=(new_grid, new_grid), mode='bicubic', align_corners=False)
+                state_dict['pos_embed_spatial'] = ckpt_spatial.permute(0, 2, 3, 1).reshape(1, new_grid * new_grid, D)
+
         msg = self.model.load_state_dict(state_dict, strict=strict)
         print(f"  # Missing keys: {len(msg.missing_keys)}")
         print(f"  # Unexpected keys: {len(msg.unexpected_keys)}")
@@ -1727,12 +1740,13 @@ def beta_nll_loss(
     beta: Float[Tensor, "B"],
     target: Float[Tensor, "B"],
     max_nll: float = 10.0,
-) -> Float[Tensor, ""]:
+) -> tuple[Float[Tensor, ""], Float[Tensor, "B"]]:
+    """Returns (clipped mean loss, raw per-sample NLL for diagnostics)."""
     target = target.clamp(1e-6, 1 - 1e-6)
     dist = Beta(alpha, beta)
-    per_sample = -dist.log_prob(target)
-    per_sample = per_sample.clamp(max=max_nll)
-    return per_sample.mean()
+    per_sample_raw = -dist.log_prob(target)
+    per_sample_clipped = per_sample_raw.clamp(max=max_nll)
+    return per_sample_clipped.mean(), per_sample_raw.detach()
 
 class OCTCubeRegression(nn.Module):
     """

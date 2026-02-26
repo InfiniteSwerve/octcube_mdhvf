@@ -338,17 +338,38 @@ def train_one_epoch(
 
     optimizer.zero_grad()
 
+    outlier_log_path = os.path.join(TrainConfig.save_dir, "loss_outliers.jsonl")
+    NLL_OUTLIER_THRESHOLD = 5.0  # Log samples with raw NLL above this
+
     for batch_idx, batch in enumerate(train_dataloader):
         imgs = batch['frames']
         labels = batch['label']
+        mrns = batch['mrn']
 
-        step_metrics, preds = one_training_step(
+        step_metrics, preds, alpha, beta_param, raw_nll = one_training_step(
             imgs,
             labels,
             model,
             scaler,
             accum,
         )
+
+        # Log outlier samples for investigation
+        for i in range(len(raw_nll)):
+            if raw_nll[i].item() > NLL_OUTLIER_THRESHOLD:
+                import json
+                entry = {
+                    "epoch": metrics.current_epoch,
+                    "iter": metrics.current_iter,
+                    "mrn": str(mrns[i]),
+                    "label_normalized": labels[i].item(),
+                    "alpha": alpha[i].item(),
+                    "beta": beta_param[i].item(),
+                    "predicted_mean": (alpha[i] / (alpha[i] + beta_param[i])).item(),
+                    "raw_nll": raw_nll[i].item(),
+                }
+                with open(outlier_log_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
 
         # Optimizer step on accumulation boundary
         if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches:
@@ -390,15 +411,16 @@ def one_training_step(
     model: nn.Module,
     scaler: GradScaler,
     accum_steps: int,
-) -> tuple[dict[str, float], Tensor]:
-    """Single micro-step: forward + scaled backward (no optimizer step)."""
+) -> tuple[dict[str, float], Tensor, Float[Tensor, "batches"], Float[Tensor, "batches"], Float[Tensor, "batches"]]:
+    """Single micro-step: forward + scaled backward (no optimizer step).
+    Returns (metrics, preds, alpha, beta, raw_nll) for diagnostics."""
     with torch.amp.autocast("cuda"):
         logits = model(images.cuda())
         alpha = logits[0].float()
         beta = logits[1].float()
 
     # Beta.log_prob uses lgamma/log/pow — must be fp32 (fp16 causes spikes)
-    loss = beta_nll_loss(alpha, beta, labels.cuda())
+    loss, per_sample_nll = beta_nll_loss(alpha, beta, labels.cuda())
     scaled_loss = loss / accum_steps
 
     scaler.scale(scaled_loss).backward()
@@ -407,7 +429,7 @@ def one_training_step(
         pred = Beta(alpha, beta).mean
 
     result = {"loss": np.exp(loss.item())}
-    return result, pred
+    return result, pred, alpha.detach(), beta.detach(), per_sample_nll
 
 
 def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_partial", max_vols=None):
@@ -437,7 +459,7 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
                 alpha = logits[0].float()
                 beta_val = logits[1].float()
 
-            loss = beta_nll_loss(alpha, beta_val, labels)
+            loss, _ = beta_nll_loss(alpha, beta_val, labels)
             pred = Beta(alpha, beta_val).mean
 
             total_loss += loss.item()
@@ -528,7 +550,7 @@ def phase1_on_features(metrics):
             labels = batch["label"].cuda()
 
             alpha, beta = head(feats)  # (B, D) -> head skips AttentionPool
-            loss = beta_nll_loss(alpha, beta, labels)
+            loss, _ = beta_nll_loss(alpha, beta, labels)
 
             optimizer.zero_grad()
             loss.backward()
@@ -562,7 +584,7 @@ def phase1_on_features(metrics):
                 feats = batch["features"].cuda()
                 labels = batch["label"].cuda()
                 alpha, beta = head(feats)
-                loss = beta_nll_loss(alpha, beta, labels)
+                loss, _ = beta_nll_loss(alpha, beta, labels)
                 pred = Beta(alpha, beta).mean
                 total_loss += loss.item()
                 all_preds.append(pred.cpu())
