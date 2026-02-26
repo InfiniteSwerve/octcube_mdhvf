@@ -1,8 +1,7 @@
 """
-Training script for OCTCube-based segmentation.
+Training script for OCTCube-based HVF MTD prediction.
 
-This script adapts the MIRAGE training pipeline to work with OCTCube,
-which processes 3D OCT volumes instead of individual slices.
+Two-phase training: head on pre-extracted features, then LoRA fine-tuning.
 """
 
 import torch
@@ -15,6 +14,7 @@ import numpy as np
 from dataset import HVFDataset, FeatureDataset
 import matplotlib.pyplot as plt
 import time
+import warnings
 from jaxtyping import Float, jaxtyped
 from beartype import beartype
 from torch import Tensor
@@ -34,9 +34,11 @@ typechecked = jaxtyped(typechecker=beartype)
 class TrainConfig:
     # Training parameters
     step_size: int = 48  # Number of slices per volume chunk (must be divisible by t_patch_size=3)
-    partial_val_interval: int = 500
+    partial_val_interval: int = 1000  # Validation every N training steps in phase 2
     train_save_im: int = 30
     plot_losses: int = 10
+    val_max_volumes: int = 100  # Number of volumes for partial validation
+    scatter_dir: str = "scatter_plots"  # Directory for per-epoch heatmap scatters
 
     # Two-phase training
     phase1_epochs: int = 5    # Head-only (encoder frozen)
@@ -71,6 +73,14 @@ class TrainConfig:
     resume_from: Optional[str] = None  # Path to resume training from (latest checkpoint)
 
 
+def _format_time(seconds):
+    """Format seconds as human-readable duration."""
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
 class Metrics:
     def __init__(self):
         from collections import defaultdict
@@ -81,7 +91,8 @@ class Metrics:
         self.current_iter = 0
         self.current_epoch = 0
         self.rolling_preds = deque(maxlen=100)
-        self.rolling_gts= deque(maxlen=100)
+        self.rolling_gts = deque(maxlen=100)
+        self.eta_str = ""
 
     def append(self, split, metrics):
         if split == "train":
@@ -93,7 +104,7 @@ class Metrics:
         self.print_latest(splits=split)
 
     def append_regression(self, preds, targets):
-        """Call each step with denormalized predictions and GT."""
+        """Call each step with predictions and GT."""
         self.rolling_preds.append(preds.detach().cpu())
         self.rolling_gts.append(targets.cpu())
 
@@ -107,15 +118,6 @@ class Metrics:
         ss_res = ((preds - gts) ** 2).sum().item()
         ss_tot = ((gts - gts.mean()) ** 2).sum().item()
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-
-        preds_np = preds.numpy()
-        gts_np = gts.numpy()
-        plt.scatter(gts_np, preds_np, alpha=0.5)
-        plt.plot([0, 1], [0, 1], 'r--')
-        plt.xlabel('GT')
-        plt.ylabel('Predicted')
-        plt.savefig("regression_scatter.png")
-        plt.close()
 
         return {"mae": mae, "pearson_r": r, "r2": r2}
 
@@ -135,7 +137,8 @@ class Metrics:
                 for k, v in self.data[split]["metrics"].items()
                 if len(v) > 0
             )
-            print(f"{split} [{self.current_epoch}:{latest_iter}]: {metrics_str}")
+            eta_part = f" | {self.eta_str}" if self.eta_str and split == "train" else ""
+            print(f"{split} [{self.current_epoch}:{latest_iter}]: {metrics_str}{eta_part}")
 
     def plot_metrics(self):
         print("Plotting Metrics")
@@ -162,6 +165,9 @@ class Metrics:
             ax.set_ylabel(metric_name)
             if metric_name == "loss":
                 ax.set_yscale("log")
+                ax.set_ylim(top=1e3)
+            elif metric_name == "r2":
+                ax.set_ylim(0, 1)
             ax.legend()
         axes[-1].set_xlabel("iteration")
         plt.tight_layout()
@@ -198,24 +204,39 @@ class Metrics:
     def should_save_train_images(self):
         return self.current_iter % TrainConfig.train_save_im == 0
 
-    def should_run_validation_partial_epoch(self):
-        return self.current_iter % TrainConfig.partial_val_interval == 0
-
     def should_plot_losses(self):
         return self.current_iter % TrainConfig.plot_losses == 0
 
-    def should_calc_dice(self):
-        return self.current_iter % TrainConfig.dice_calc_interval == 0
 
-    def should_print_volume_report(self):
-        return self.current_iter % TrainConfig.volume_report_interval == 0
+def plot_pred_vs_gt_heatmap(preds_np, gts_np, epoch, save_dir="scatter_plots", title=""):
+    """Save a 2D histogram heatmap of predictions vs ground truth."""
+    os.makedirs(save_dir, exist_ok=True)
 
-    def get_latest_val_dice(self) -> Optional[float]:
-        """Get the most recent validation dice_mean score."""
-        dice_vals = self.data["val"]["metrics"].get("dice_mean", [])
-        if dice_vals:
-            return dice_vals[-1]
-        return None
+    r2 = 1.0 - np.sum((preds_np - gts_np) ** 2) / max(np.sum((gts_np - gts_np.mean()) ** 2), 1e-8)
+    mae = np.abs(preds_np - gts_np).mean()
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    vmin = min(gts_np.min(), preds_np.min())
+    vmax = max(gts_np.max(), preds_np.max())
+    bins = np.linspace(vmin, vmax, 60)
+    h, xedges, yedges = np.histogram2d(gts_np, preds_np, bins=bins)
+    h_log = np.log1p(h)
+    ax.imshow(h_log.T, origin='lower', aspect='auto',
+              extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+              cmap='viridis')
+    ax.plot([vmin, vmax], [vmin, vmax], 'r--', linewidth=1.5, label='y=x')
+    ax.set_xlabel('Ground Truth')
+    ax.set_ylabel('Predicted')
+    title_str = f'Epoch {epoch}'
+    if title:
+        title_str = f'{title} - {title_str}'
+    ax.set_title(f'{title_str}\nR\u00b2={r2:.4f}  MAE={mae:.4f}')
+    ax.legend(loc='upper left', fontsize=8)
+    plt.tight_layout()
+    path = os.path.join(save_dir, f"epoch_{epoch:03d}.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved heatmap scatter to {path}")
 
 
 def save_checkpoint(model, optimizer, scaler, metrics, path, is_best=False, save_encoder=False):
@@ -309,6 +330,8 @@ def train_one_epoch(
     """Training epoch with gradient accumulation."""
     model.train()
     accum = TrainConfig.grad_accum_steps
+    total_batches = len(train_dataloader)
+    epoch_start = time.time()
 
     optimizer.zero_grad()
 
@@ -325,7 +348,7 @@ def train_one_epoch(
         )
 
         # Optimizer step on accumulation boundary
-        if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == len(train_dataloader):
+        if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
@@ -334,12 +357,22 @@ def train_one_epoch(
             if scheduler is not None:
                 scheduler.step()
 
+        # ETA calculation
+        elapsed = time.time() - epoch_start
+        steps_done = batch_idx + 1
+        eta_seconds = (elapsed / steps_done) * (total_batches - steps_done)
+        metrics.eta_str = f"{_format_time(elapsed)} elapsed, ETA {_format_time(eta_seconds)}"
+
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
         metrics.append("train", step_metrics)
 
         if metrics.should_plot_losses():
             metrics.plot_metrics()
+
+        # Periodic validation
+        if metrics.current_iter % TrainConfig.partial_val_interval == 0:
+            validation_partial_epoch(model, val_dataloader, metrics)
 
 
 @typechecked
@@ -369,113 +402,65 @@ def one_training_step(
     return result, pred
 
 
-def validation_epoch(model, dataloader, metrics: Metrics, split):
-    """Full validation epoch."""
-    from collections import defaultdict
+def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_partial", max_vols=None):
+    """Partial validation for regression: run ~max_vols volumes, compute metrics."""
+    if max_vols is None:
+        max_vols = TrainConfig.val_max_volumes
 
-    print(f"Running validation: {split}")
+    print(f"Running partial validation ({max_vols} volumes)...")
     model.eval()
 
-    results = defaultdict(lambda: 0.0)
-    num_steps = 0
+    all_preds = []
+    all_labels = []
+    total_loss = 0.0
+    num_batches = 0
+    num_vols = 0
 
     with torch.no_grad():
         for batch in dataloader:
-            ims = batch["frames"].permute(1, 0, 2, 3).cuda()
-            height = batch["label"][0].permute(1, 0, 2).cuda()
-            S, C, H, W = ims.shape
-
-            for run in range(0, S, TrainConfig.step_size):
-                end_idx = min(run + TrainConfig.step_size, S)
-                chunk_size = end_idx - run
-
-                # Pad if necessary
-                if chunk_size % TrainConfig.t_patch_size != 0:
-                    pad_size = TrainConfig.t_patch_size - (chunk_size % TrainConfig.t_patch_size)
-                    chunk_ims = ims[run:end_idx]
-                    chunk_height = height[run:end_idx]
-                    chunk_ims = torch.cat([chunk_ims, chunk_ims[-1:].expand(pad_size, -1, -1, -1)], dim=0)
-                    chunk_height = torch.cat([chunk_height, chunk_height[-1:].expand(pad_size, -1, -1)], dim=0)
-                else:
-                    chunk_ims = ims[run:end_idx]
-                    chunk_height = height[run:end_idx]
-
-                local_metrics = one_validation_step(
-                    model,
-                    chunk_ims,
-                    chunk_height,
-                    metrics,
-                    num_steps == 0,
-                    split,
-                )
-                for k, v in local_metrics.items():
-                    results[k] += v
-                num_steps += 1
-
-    for k, v in results.items():
-        results[k] = v / max(num_steps, 1)
-
-    metrics.append(split, dict(results))
-    metrics.print_latest(split)
-    metrics.plot_metrics()
-
-
-def validation_partial_epoch(model, dataloader, metrics: Metrics, split):
-    """Partial validation on subset of data."""
-    from collections import defaultdict
-
-    print("Running Partial Validation")
-    model.eval()
-
-    results = defaultdict(lambda: 0.0)
-    num_steps = 0
-    max_vols = 10
-
-    with torch.no_grad():
-        for vol_idx, batch in enumerate(dataloader):
-            if vol_idx >= max_vols:
+            if num_vols >= max_vols:
                 break
 
-            ims = batch["frames"].permute(1, 0, 2, 3).cuda()
-            height = batch["label"][0].permute(1, 0, 2).cuda()
-            S, C, H, W = ims.shape
+            imgs = batch['frames'].cuda()
+            labels = batch['label'].cuda()
 
-            # Just process first chunk for speed
-            end_idx = min(TrainConfig.step_size, S)
-            chunk_size = end_idx
+            with torch.amp.autocast("cuda"):
+                logits = model(imgs)
+                alpha = logits[0].float()
+                beta_val = logits[1].float()
 
-            if chunk_size % TrainConfig.t_patch_size != 0:
-                pad_size = TrainConfig.t_patch_size - (chunk_size % TrainConfig.t_patch_size)
-                chunk_ims = ims[:end_idx]
-                chunk_height = height[:end_idx]
-                chunk_ims = torch.cat([chunk_ims, chunk_ims[-1:].expand(pad_size, -1, -1, -1)], dim=0)
-                chunk_height = torch.cat([chunk_height, chunk_height[-1:].expand(pad_size, -1, -1)], dim=0)
-            else:
-                chunk_ims = ims[:end_idx]
-                chunk_height = height[:end_idx]
+            loss = beta_nll_loss(alpha, beta_val, labels)
+            pred = Beta(alpha, beta_val).mean
 
-            local_metrics = one_validation_step(
-                model,
-                chunk_ims,
-                chunk_height,
-                metrics,
-                vol_idx == 0,
-                split,
-            )
-            for k, v in local_metrics.items():
-                results[k] += v
-            num_steps += 1
+            total_loss += loss.item()
+            all_preds.append(pred.cpu())
+            all_labels.append(batch['label'])
+            num_batches += 1
+            num_vols += imgs.shape[0]
 
-    for k, v in results.items():
-        results[k] = v / max(num_steps, 1)
+    preds = torch.cat(all_preds)
+    gts = torch.cat(all_labels)
 
-    metrics.append(split, dict(results))
-    metrics.print_latest(split)
+    avg_loss = total_loss / max(num_batches, 1)
+    mae = (preds - gts).abs().mean().item()
+    r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item()
+    ss_res = ((preds - gts) ** 2).sum().item()
+    ss_tot = ((gts - gts.mean()) ** 2).sum().item()
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    val_metrics = {
+        "loss": np.exp(avg_loss),
+        "mae": mae,
+        "pearson_r": r,
+        "r2": r2,
+    }
+
+    metrics.append(split, val_metrics)
     metrics.plot_metrics()
     metrics.save("octcube_metrics.json")
     model.train()
 
-
+    return preds.numpy(), gts.numpy()
 
 
 def make_loaders(batch_size):
@@ -501,7 +486,7 @@ def make_loaders(batch_size):
     return train_loader, val_loader
 
 
-def phase1_on_features():
+def phase1_on_features(metrics):
     """Phase 1: Train head MLP on pre-extracted features. No encoder needed."""
     fdir = TrainConfig.feature_dir
     pool = TrainConfig.feature_pool
@@ -518,7 +503,6 @@ def phase1_on_features():
     embed_dim = 1024 if TrainConfig.model_size == 'large' else 768
     head = BetaRegressionHead(in_features=embed_dim, hidden_dim=256).cuda()
 
-    metrics = Metrics()
     optimizer = torch.optim.AdamW(head.parameters(), lr=TrainConfig.head_lr)
 
     print("=" * 60)
@@ -530,7 +514,10 @@ def phase1_on_features():
     for e in range(1, TrainConfig.phase1_epochs + 1):
         metrics.current_epoch = e
         head.train()
-        for batch in train_loader:
+        epoch_start = time.time()
+        total_batches = len(train_loader)
+
+        for batch_idx, batch in enumerate(train_loader):
             feats = batch["features"].cuda()
             labels = batch["label"].cuda()
 
@@ -545,10 +532,47 @@ def phase1_on_features():
             metrics.append_regression(pred, batch["label"])
             step_metrics = {"loss": np.exp(loss.item())}
             step_metrics.update(metrics.get_regression_metrics())
+
+            # ETA
+            elapsed = time.time() - epoch_start
+            steps_done = batch_idx + 1
+            eta_seconds = (elapsed / steps_done) * (total_batches - steps_done)
+            metrics.eta_str = f"{_format_time(elapsed)} elapsed, ETA {_format_time(eta_seconds)}"
+
             metrics.append("train", step_metrics)
 
-        if metrics.should_plot_losses():
-            metrics.plot_metrics()
+        # End-of-epoch: validate on feature val set
+        head.eval()
+        all_preds, all_labels = [], []
+        total_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                feats = batch["features"].cuda()
+                labels = batch["label"].cuda()
+                alpha, beta = head(feats)
+                loss = beta_nll_loss(alpha, beta, labels)
+                pred = Beta(alpha, beta).mean
+                total_loss += loss.item()
+                all_preds.append(pred.cpu())
+                all_labels.append(batch["label"])
+
+        preds = torch.cat(all_preds)
+        gts = torch.cat(all_labels)
+        avg_loss = total_loss / max(len(val_loader), 1)
+        mae = (preds - gts).abs().mean().item()
+        r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item()
+        ss_res = ((preds - gts) ** 2).sum().item()
+        ss_tot = ((gts - gts.mean()) ** 2).sum().item()
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        val_metrics = {"loss": np.exp(avg_loss), "mae": mae, "pearson_r": r, "r2": r2}
+        metrics.append("val", val_metrics)
+
+        # Heatmap scatter for this epoch
+        plot_pred_vs_gt_heatmap(preds.numpy(), gts.numpy(), e, TrainConfig.scatter_dir, "Phase 1")
+
+        metrics.plot_metrics()
+        metrics.eta_str = ""
         print(f"  Epoch {e}/{TrainConfig.phase1_epochs} done")
 
     print("Phase 1 complete.")
@@ -559,13 +583,17 @@ def full_supervised_run():
     """Two-phase training: head on features, then LoRA fine-tuning on full model."""
     os.makedirs("selected_images", exist_ok=True)
     os.makedirs(TrainConfig.save_dir, exist_ok=True)
+    os.makedirs(TrainConfig.scatter_dir, exist_ok=True)
 
     latest_path = os.path.join(TrainConfig.save_dir, "latest.pt")
+
+    # Single metrics object shared across both phases
+    metrics = Metrics()
 
     # ----------------------------------------------------------------
     # Phase 1: Train head on pre-extracted features (seconds, not hours)
     # ----------------------------------------------------------------
-    head_state = phase1_on_features()
+    head_state = phase1_on_features(metrics)
 
     # Save phase 1 head weights
     phase1_path = os.path.join(TrainConfig.save_dir, "phase1_head.pt")
@@ -604,7 +632,6 @@ def full_supervised_run():
     )
     print(f"LoRA injected: {lora_params:,} trainable params (vs ~300M frozen encoder)")
 
-    metrics = Metrics()
     scaler = GradScaler("cuda")
     train_loader, val_loader = make_loaders(TrainConfig.phase1_batch_size)
 
@@ -623,7 +650,6 @@ def full_supervised_run():
     # Warmup scheduler for LoRA adapter LR
     total_phase2_steps = TrainConfig.phase2_epochs * len(train_loader)
     warmup_steps = int(TrainConfig.warmup_fraction * total_phase2_steps)
-    import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # LambdaLR.__init__ calls step() before any optimizer.step()
         scheduler = get_warmup_scheduler(optimizer, warmup_steps)
@@ -638,6 +664,11 @@ def full_supervised_run():
             train_loader, val_loader, metrics,
             scheduler=scheduler,
         )
+
+        # End-of-epoch validation + heatmap scatter
+        preds, gts = validation_partial_epoch(model, val_loader, metrics, split="val")
+        plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, "Phase 2")
+
         save_checkpoint(model, optimizer, scaler, metrics, latest_path, save_encoder=True)
 
     # Save final
