@@ -46,6 +46,7 @@ class TrainConfig:
     encoder_lr: float = 1e-5
     head_lr: float = 1e-3
     phase2_head_lr: float = 1e-4  # Lower LR for head MLP in phase 2 (already pretrained)
+    phase2_pool_lr: float = 1e-4  # Pool LR — must stay close to MLP LR to avoid disrupting learned features
     warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
     grad_accum_steps: int = 4  # Gradient accumulation steps (effective batch = batch_size * accum)
 
@@ -643,7 +644,7 @@ def full_supervised_run():
     mlp_params = list(model.head.mlp.parameters())
     optimizer = torch.optim.AdamW([
         {"params": lora_adapter_params, "lr": TrainConfig.encoder_lr},
-        {"params": pool_params, "lr": TrainConfig.head_lr},
+        {"params": pool_params, "lr": TrainConfig.phase2_pool_lr},
         {"params": mlp_params, "lr": TrainConfig.phase2_head_lr},
     ])
 
