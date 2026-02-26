@@ -271,10 +271,24 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        self.compute_entropy = False
+        self._last_entropy: float | None = None  # Mean entropy (nats), set when compute_entropy=True
+
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+
+        # Compute entropy on a sampled subset of queries (cheap, no grad needed)
+        if self.compute_entropy:
+            with torch.no_grad():
+                n_sample = min(64, N)
+                idx = torch.randperm(N, device=q.device)[:n_sample]
+                q_s = q[:, :, idx, :]            # (B, H, n_sample, D)
+                logits = (q_s @ k.transpose(-2, -1)) * self.scale  # (B, H, n_sample, N)
+                p = logits.float().softmax(dim=-1)
+                ent = -(p * p.clamp(min=1e-8).log()).sum(dim=-1)   # (B, H, n_sample)
+                self._last_entropy = ent.mean().item()
 
         x = F.scaled_dot_product_attention(
             q, k, v,
@@ -1819,6 +1833,15 @@ class OCTCubeRegression(nn.Module):
 
         alpha, beta = self.head(tokens)
         return alpha, beta
+
+    def enable_entropy(self, enable: bool = True):
+        """Toggle attention entropy computation on the last encoder block."""
+        last_block = self.encoder.model.blocks[-1]
+        last_block.attn.compute_entropy = enable
+
+    def get_last_block_entropy(self) -> float | None:
+        """Return mean attention entropy (nats) from the last encoder block, or None."""
+        return self.encoder.model.blocks[-1].attn._last_entropy
 
     @beartype
     def extract_features(

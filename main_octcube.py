@@ -402,6 +402,10 @@ def train_one_epoch(
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
         step_metrics["grad_norm_preclip"] = last_grad_norm
+        if hasattr(model, 'get_last_block_entropy'):
+            ent = model.get_last_block_entropy()
+            if ent is not None:
+                step_metrics["attn_entropy"] = ent
         metrics.append("train", step_metrics)
 
         if metrics.should_plot_losses():
@@ -687,6 +691,8 @@ def full_supervised_run():
     print(f"Unfroze last {n_unfreeze}/{n_blocks} blocks + norm: "
           f"{encoder_trainable_count:,} trainable params "
           f"(of {total_encoder:,} total encoder params)")
+
+    model.enable_entropy(True)
 
     scaler = GradScaler("cuda")
     train_loader, val_loader = make_loaders(TrainConfig.phase2_batch_size)
