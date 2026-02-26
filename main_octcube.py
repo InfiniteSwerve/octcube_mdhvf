@@ -48,11 +48,13 @@ class TrainConfig:
     phase2_head_lr: float = 1e-4  # Lower LR for head MLP in phase 2 (already pretrained)
     phase2_pool_lr: float = 1e-4  # Pool LR — must stay close to MLP LR to avoid disrupting learned features
     warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
+    head_freeze_epochs: int = 2   # Freeze head during first N epochs of phase 2 (LoRA-only warmup)
     grad_accum_steps: int = 4  # Gradient accumulation steps (effective batch = batch_size * accum)
 
     # LoRA config for phase 2
     lora_rank: int = 16
     lora_alpha: float = 16.0
+    lora_last_n_layers: int = 4  # Only adapt last N encoder blocks (24 total for large)
 
     # Pre-extracted features for phase 1 (skip encoder forward pass entirely)
     feature_dir: str = "extracted_features"
@@ -639,7 +641,7 @@ def full_supervised_run():
     # ----------------------------------------------------------------
     print("=" * 60)
     print(f"Phase 2: LoRA fine-tuning for {TrainConfig.phase2_epochs} epochs")
-    print(f"  LoRA rank={TrainConfig.lora_rank}, alpha={TrainConfig.lora_alpha}")
+    print(f"  LoRA rank={TrainConfig.lora_rank}, alpha={TrainConfig.lora_alpha}, last {TrainConfig.lora_last_n_layers} layers")
     print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
     spatial_patches = (TrainConfig.img_size // TrainConfig.patch_size) ** 2
     temporal_patches = TrainConfig.num_frames // TrainConfig.t_patch_size
@@ -664,52 +666,114 @@ def full_supervised_run():
     model.head.load_state_dict(head_state)
     print("Loaded phase 1 head weights into full model")
 
-    # Inject LoRA adapters into encoder attention layers
+    # Inject LoRA adapters into last N encoder attention layers
     lora_params = apply_lora_to_encoder(
         model.encoder,
         rank=TrainConfig.lora_rank,
         alpha=TrainConfig.lora_alpha,
+        last_n_layers=TrainConfig.lora_last_n_layers,
     )
-    print(f"LoRA injected: {lora_params:,} trainable params (vs ~300M frozen encoder)")
+    n_blocks = len(list(model.encoder.model.blocks))
+    print(f"LoRA injected into last {TrainConfig.lora_last_n_layers}/{n_blocks} blocks: "
+          f"{lora_params:,} trainable params (vs ~300M frozen encoder)")
 
     scaler = GradScaler("cuda")
     train_loader, val_loader = make_loaders(TrainConfig.phase1_batch_size)
 
-    # Collect only trainable params: LoRA adapters + pool + head MLP
-    # AttentionPool was never trained in phase 1 (features were pre-pooled),
-    # so it needs warmup just like the LoRA adapters.
     lora_adapter_params = [p for p in model.encoder.parameters() if p.requires_grad]
     pool_params = list(model.head.pool.parameters())
     mlp_params = list(model.head.mlp.parameters())
+
+    # ------------------------------------------------------------------
+    # Phase 2a: LoRA-only warmup (head frozen)
+    # ------------------------------------------------------------------
+    hf = TrainConfig.head_freeze_epochs
+    if hf > 0:
+        print(f"\n--- Phase 2a: LoRA warmup with head frozen ({hf} epochs) ---")
+        # Freeze head
+        for p in pool_params + mlp_params:
+            p.requires_grad = False
+
+        optimizer_2a = torch.optim.AdamW([
+            {"params": lora_adapter_params, "lr": TrainConfig.encoder_lr},
+        ])
+
+        steps_per_epoch = len(train_loader) // TrainConfig.grad_accum_steps
+        warmup_steps_2a = int(TrainConfig.warmup_fraction * hf * steps_per_epoch)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            scheduler_2a = torch.optim.lr_scheduler.LambdaLR(
+                optimizer_2a,
+                [lambda step, ws=warmup_steps_2a: step / max(ws, 1) if step < ws else 1.0],
+            )
+        print(f"  LoRA warmup: {warmup_steps_2a} scheduler steps over {hf} epochs")
+
+        for e in range(1, hf + 1):
+            epoch_num = TrainConfig.phase1_epochs + e
+            metrics.current_epoch = epoch_num
+            print(f"Phase 2a - Epoch {e}/{hf} (overall {epoch_num})  [head frozen]")
+            train_one_epoch(
+                model, optimizer_2a, scaler,
+                train_loader, val_loader, metrics,
+                scheduler=scheduler_2a,
+                remaining_epochs=TrainConfig.phase2_epochs - e + 1,
+            )
+
+            preds, gts = validation_partial_epoch(model, val_loader, metrics, split="val")
+            plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, "Phase 2a")
+            save_checkpoint(model, optimizer_2a, scaler, metrics, latest_path, save_encoder=True)
+
+        # Unfreeze head
+        for p in pool_params + mlp_params:
+            p.requires_grad = True
+        print("--- Head unfrozen, starting phase 2b ---\n")
+
+    # ------------------------------------------------------------------
+    # Phase 2b: Full fine-tuning (LoRA + head)
+    # ------------------------------------------------------------------
+    remaining_epochs = TrainConfig.phase2_epochs - hf
     optimizer = torch.optim.AdamW([
         {"params": lora_adapter_params, "lr": TrainConfig.encoder_lr},
         {"params": pool_params, "lr": TrainConfig.phase2_pool_lr},
         {"params": mlp_params, "lr": TrainConfig.phase2_head_lr},
     ])
 
-    # Warmup scheduler for LoRA adapter LR
-    # Scheduler steps once per optimizer step (every grad_accum_steps batches)
-    total_optimizer_steps = (TrainConfig.phase2_epochs * len(train_loader)) // TrainConfig.grad_accum_steps
-    warmup_steps = int(TrainConfig.warmup_fraction * total_optimizer_steps)
+    # Warmup for pool (random init, never saw data in phase 1).
+    # LoRA adapters already warmed up in 2a so they start at full LR.
+    # Head MLP is pretrained from phase 1 so constant LR.
+    total_optimizer_steps = (remaining_epochs * len(train_loader)) // TrainConfig.grad_accum_steps
+    warmup_steps = int(TrainConfig.warmup_fraction * total_optimizer_steps) if hf == 0 else 0
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # LambdaLR.__init__ calls step() before any optimizer.step()
-        scheduler = get_warmup_scheduler(optimizer, warmup_steps)
-    print(f"Warmup: {warmup_steps} optimizer steps out of {total_optimizer_steps} total")
+        warnings.simplefilter("ignore")
+        if hf > 0:
+            # LoRA already warm — only pool needs warmup
+            pool_warmup = int(TrainConfig.warmup_fraction * total_optimizer_steps)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [
+                lambda step: 1.0,  # LoRA: already warm, full LR
+                lambda step, ws=pool_warmup: step / max(ws, 1) if step < ws else 1.0,  # Pool: warmup
+                lambda step: 1.0,  # MLP: constant
+            ])
+            print(f"Phase 2b: {remaining_epochs} epochs, pool warmup {pool_warmup} steps")
+        else:
+            warmup_steps = int(TrainConfig.warmup_fraction * total_optimizer_steps)
+            scheduler = get_warmup_scheduler(optimizer, warmup_steps)
+            print(f"Phase 2b: {remaining_epochs} epochs, warmup {warmup_steps} steps")
 
-    for e in range(1, TrainConfig.phase2_epochs + 1):
-        epoch_num = TrainConfig.phase1_epochs + e
+    for e in range(1, remaining_epochs + 1):
+        epoch_num = TrainConfig.phase1_epochs + hf + e
         metrics.current_epoch = epoch_num
-        print(f"Phase 2 - Epoch {e}/{TrainConfig.phase2_epochs} (overall {epoch_num})")
+        phase_label = "Phase 2b" if hf > 0 else "Phase 2"
+        print(f"{phase_label} - Epoch {e}/{remaining_epochs} (overall {epoch_num})")
         train_one_epoch(
             model, optimizer, scaler,
             train_loader, val_loader, metrics,
             scheduler=scheduler,
-            remaining_epochs=TrainConfig.phase2_epochs - e + 1,
+            remaining_epochs=remaining_epochs - e + 1,
         )
 
         # End-of-epoch validation + heatmap scatter
         preds, gts = validation_partial_epoch(model, val_loader, metrics, split="val")
-        plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, "Phase 2")
+        plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, phase_label)
 
         save_checkpoint(model, optimizer, scaler, metrics, latest_path, save_encoder=True)
 

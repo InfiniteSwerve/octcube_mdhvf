@@ -189,21 +189,26 @@ def apply_lora_to_encoder(
     rank: int = 16,
     alpha: float = 16.0,
     targets: tuple[str, ...] = ("qkv", "proj"),
+    last_n_layers: int | None = None,
 ) -> int:
     """
-    Inject LoRA adapters into every Attention layer of the encoder.
+    Inject LoRA adapters into Attention layers of the encoder.
 
     Args:
         encoder: OCTCubeWrapper (has .model.blocks)
         rank: LoRA rank
         alpha: LoRA scaling factor
         targets: which attention sub-layers to adapt ("qkv" and/or "proj")
+        last_n_layers: Only adapt the last N transformer blocks. None = all blocks.
 
     Returns:
         Number of trainable parameters added.
     """
+    blocks = list(encoder.model.blocks)
+    if last_n_layers is not None:
+        blocks = blocks[-last_n_layers:]
     count = 0
-    for block in encoder.model.blocks:
+    for block in blocks:
         attn = block.attn
         for name in targets:
             orig_linear = getattr(attn, name)
