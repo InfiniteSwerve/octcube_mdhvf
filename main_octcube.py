@@ -50,6 +50,7 @@ class TrainConfig:
     warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
     head_freeze_epochs: int = 2   # Freeze head during first N epochs of phase 2 (LoRA-only warmup)
     grad_accum_steps: int = 4  # Gradient accumulation steps (effective batch = batch_size * accum)
+    max_grad_norm: float = 1.0  # Gradient clipping (on trainable params only)
 
     # LoRA config for phase 2
     lora_rank: int = 16
@@ -342,6 +343,7 @@ def train_one_epoch(
 
     outlier_log_path = os.path.join(TrainConfig.save_dir, "loss_outliers.jsonl")
     NLL_OUTLIER_THRESHOLD = 5.0  # Log samples with raw NLL above this
+    last_grad_norm = 0.0
 
     for batch_idx, batch in enumerate(train_dataloader):
         imgs = batch['frames']
@@ -376,7 +378,8 @@ def train_one_epoch(
         # Optimizer step on accumulation boundary
         if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            trainable = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+            last_grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=TrainConfig.max_grad_norm).item()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -396,6 +399,7 @@ def train_one_epoch(
 
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
+        step_metrics["grad_norm"] = last_grad_norm
         metrics.append("train", step_metrics)
 
         if metrics.should_plot_losses():
