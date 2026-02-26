@@ -49,7 +49,7 @@ class TrainConfig:
     warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
     head_freeze_epochs: int = 2   # Freeze head during first N epochs of phase 2 (encoder-only warmup)
     grad_accum_steps: int = 4  # Gradient accumulation steps (effective batch = batch_size * accum)
-    max_grad_norm: float = 1.0  # Gradient clipping (on trainable params only)
+    max_grad_norm: float = 50.0  # Gradient clipping (on trainable params only)
 
     # Phase 2 encoder unfreezing
     unfreeze_last_n_layers: int = 1  # Unfreeze last N encoder blocks + final norm
