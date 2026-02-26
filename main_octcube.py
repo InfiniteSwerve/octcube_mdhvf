@@ -398,7 +398,7 @@ def one_training_step(
     """Single micro-step: forward + backward (no optimizer step).
     Returns (metrics, preds) for diagnostics."""
     pred = model(images.cuda()).float()
-    loss = F.mse_loss(pred, labels.cuda())
+    loss = F.mse_loss(pred, labels.cuda().float())
     scaled_loss = loss / accum_steps
 
     scaled_loss.backward()
@@ -430,7 +430,7 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
             labels = batch['label'].cuda()
 
             pred = model(imgs).float()
-            loss = F.mse_loss(pred, labels)
+            loss = F.mse_loss(pred, labels.float())
 
             total_loss += loss.item()
             all_preds.append(pred.cpu())
