@@ -395,6 +395,8 @@ def train_one_epoch(
         metrics.append_regression(preds, labels)
         step_metrics.update(metrics.get_regression_metrics())
         step_metrics["grad_norm_preclip"] = last_grad_norm
+        step_metrics["alpha"] = alpha.mean().item()
+        step_metrics["beta"] = beta_param.mean().item()
         if hasattr(model, 'get_last_block_entropy'):
             ent = model.get_last_block_entropy()
             if ent is not None:
