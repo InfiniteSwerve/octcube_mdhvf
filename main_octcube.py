@@ -183,8 +183,8 @@ class Metrics:
         """Scatter plot of GT vs predicted for the last 100 training samples."""
         if len(self.rolling_preds) < 2:
             return
-        preds = torch.cat(list(self.rolling_preds)).numpy()
-        gts = torch.cat(list(self.rolling_gts)).numpy()
+        preds = torch.cat(list(self.rolling_preds)).numpy()[-100:]
+        gts = torch.cat(list(self.rolling_gts)).numpy()[-100:]
 
         fig, ax = plt.subplots(1, 1, figsize=(6, 6))
         ax.scatter(gts, preds, alpha=0.6, s=20)
