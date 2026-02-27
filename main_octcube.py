@@ -65,7 +65,7 @@ class TrainConfig:
     model_size: str = 'large'
     center_crop_frac: float = 0.5  # Crop to center 50% of W before resize (None to disable)
     phase1_batch_size: int = 2   # Phase 1 (features only)
-    phase2_batch_size: int = 1   # Phase 2 (full model, encoder partially unfrozen)
+    phase2_batch_size: int = 32  # Phase 2 (full model, encoder partially unfrozen)
     num_workers: int = 25
 
     # Paths
@@ -403,7 +403,7 @@ def one_training_step(
 
     scaled_loss.backward()
 
-    result = {"loss": loss.item()}
+    result = {"loss": loss.item(), "pred_std": pred.detach().std().item()}
     return result, pred.detach()
 
 
@@ -453,6 +453,7 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
         "mae": mae,
         "pearson_r": r,
         "r2": r2,
+        "pred_std": preds.std().item(),
     }
 
     metrics.append(split, val_metrics)
@@ -526,7 +527,7 @@ def phase1_on_features(metrics):
             loss.backward()
             optimizer.step()
             metrics.append_regression(pred, batch["label"])
-            step_metrics = {"loss": loss.item()}
+            step_metrics = {"loss": loss.item(), "pred_std": pred.detach().std().item()}
             step_metrics.update(metrics.get_regression_metrics())
 
             # ETA
@@ -566,7 +567,7 @@ def phase1_on_features(metrics):
         ss_tot = ((gts - gts.mean()) ** 2).sum().item()
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
-        val_metrics = {"loss": avg_loss, "mae": mae, "pearson_r": r, "r2": r2}
+        val_metrics = {"loss": avg_loss, "mae": mae, "pearson_r": r, "r2": r2, "pred_std": preds.std().item()}
         metrics.append("val", val_metrics)
 
         # Heatmap scatter for this epoch
