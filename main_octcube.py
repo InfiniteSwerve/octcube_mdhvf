@@ -41,7 +41,7 @@ class TrainConfig:
     # Two-phase training
     phase1_epochs: int = 5    # Head-only (encoder frozen)
     phase2_epochs: int = 15   # End-to-end (encoder unfrozen with warmup)
-    encoder_lr: float = 1e-5
+    encoder_lr: float = 1e-7
     head_lr: float = 1e-3
     phase2_head_lr: float = 1e-4  # Lower LR for head MLP in phase 2 (already pretrained)
     phase2_pool_lr: float = 1e-4  # Pool LR — must stay close to MLP LR to avoid disrupting learned features
@@ -193,9 +193,12 @@ class Metrics:
         ax.plot([vmin, vmax], [vmin, vmax], 'r--', linewidth=1.5, label='y=x')
         mae = np.abs(preds - gts).mean()
         r = np.corrcoef(preds, gts)[0, 1] if len(preds) > 1 else 0.0
+        ss_res = np.sum((preds - gts) ** 2)
+        ss_tot = np.sum((gts - gts.mean()) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
         ax.set_xlabel('Ground Truth')
         ax.set_ylabel('Predicted')
-        ax.set_title(f'Last {len(preds)} samples (iter {self.current_iter})\nMAE={mae:.4f}  r={r:.4f}')
+        ax.set_title(f'Last {len(preds)} samples (iter {self.current_iter})\nMAE={mae:.4f}  r={r:.4f}  R\u00b2={r2:.4f}')
         ax.legend(loc='upper left', fontsize=8)
         plt.tight_layout()
         plt.savefig("rolling_scatter.png")
