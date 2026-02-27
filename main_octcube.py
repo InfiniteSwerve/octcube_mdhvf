@@ -47,7 +47,7 @@ class TrainConfig:
     phase2_pool_lr: float = 1e-4  # Pool LR — must stay close to MLP LR to avoid disrupting learned features
     warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
     head_freeze_epochs: int = 2   # Freeze head during first N epochs of phase 2 (encoder-only warmup)
-    grad_accum_steps: int = 4  # Gradient accumulation steps (effective batch = batch_size * accum)
+    grad_accum_steps: int = 32  # Gradient accumulation steps (effective batch = batch_size * accum)
     max_grad_norm: float = 50.0  # Gradient clipping (on trainable params only)
 
     # Phase 2 encoder unfreezing
@@ -65,7 +65,7 @@ class TrainConfig:
     model_size: str = 'large'
     center_crop_frac: float = 0.5  # Crop to center 50% of W before resize (None to disable)
     phase1_batch_size: int = 2   # Phase 1 (features only)
-    phase2_batch_size: int = 32  # Phase 2 (full model, encoder partially unfrozen)
+    phase2_batch_size: int = 1   # Phase 2 (full model, encoder partially unfrozen)
     num_workers: int = 25
 
     # Paths
@@ -177,6 +177,28 @@ class Metrics:
         axes[-1].set_xlabel("iteration")
         plt.tight_layout()
         plt.savefig("octcube_metrics.png")
+        plt.close()
+
+    def plot_rolling_scatter(self):
+        """Scatter plot of GT vs predicted for the last 100 training samples."""
+        if len(self.rolling_preds) < 2:
+            return
+        preds = torch.cat(list(self.rolling_preds)).numpy()
+        gts = torch.cat(list(self.rolling_gts)).numpy()
+
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+        ax.scatter(gts, preds, alpha=0.6, s=20)
+        vmin = min(gts.min(), preds.min())
+        vmax = max(gts.max(), preds.max())
+        ax.plot([vmin, vmax], [vmin, vmax], 'r--', linewidth=1.5, label='y=x')
+        mae = np.abs(preds - gts).mean()
+        r = np.corrcoef(preds, gts)[0, 1] if len(preds) > 1 else 0.0
+        ax.set_xlabel('Ground Truth')
+        ax.set_ylabel('Predicted')
+        ax.set_title(f'Last {len(preds)} samples (iter {self.current_iter})\nMAE={mae:.4f}  r={r:.4f}')
+        ax.legend(loc='upper left', fontsize=8)
+        plt.tight_layout()
+        plt.savefig("rolling_scatter.png")
         plt.close()
 
     def save(self, path):
@@ -382,6 +404,7 @@ def train_one_epoch(
 
         if metrics.should_plot_losses():
             metrics.plot_metrics()
+            metrics.plot_rolling_scatter()
 
         # Periodic validation
         if metrics.current_iter % TrainConfig.partial_val_interval == 0:
@@ -458,6 +481,7 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
 
     metrics.append(split, val_metrics)
     metrics.plot_metrics()
+    metrics.plot_rolling_scatter()
     metrics.save("octcube_metrics.json")
     model.train()
 
@@ -574,6 +598,7 @@ def phase1_on_features(metrics):
         plot_pred_vs_gt_heatmap(preds.numpy(), gts.numpy(), e, TrainConfig.scatter_dir, "Phase 1")
 
         metrics.plot_metrics()
+        metrics.plot_rolling_scatter()
         metrics.eta_str = ""
         print(f"  Epoch {e}/{TrainConfig.phase1_epochs} done")
 
@@ -750,6 +775,7 @@ def full_supervised_run():
     # Save final
     metrics.save(os.path.join(TrainConfig.save_dir, "metrics_final.json"))
     metrics.plot_metrics()
+    metrics.plot_rolling_scatter()
     print("Training complete.")
 
 
