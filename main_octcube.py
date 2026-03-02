@@ -354,6 +354,7 @@ def train_one_epoch(
 ):
     """Training epoch with gradient accumulation."""
     model.train()
+    model.encoder.eval()
     accum = TrainConfig.grad_accum_steps
     total_batches = len(train_dataloader)
     epoch_start = time.time()
@@ -409,6 +410,9 @@ def train_one_epoch(
         # Periodic validation
         if metrics.current_iter % TrainConfig.partial_val_interval == 0:
             validation_partial_epoch(model, val_dataloader, metrics)
+            model.encoder.eval()
+
+
 
 
 @typechecked
@@ -436,7 +440,6 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
         max_vols = TrainConfig.val_max_volumes
 
     print(f"Running partial validation ({max_vols} volumes)...")
-    model.eval()
 
     all_preds = []
     all_labels = []
