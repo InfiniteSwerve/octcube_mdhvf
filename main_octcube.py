@@ -23,7 +23,7 @@ import shutil
 from collections import deque
 import tqdm
 
-from octcube import OCTCubeRegression, SimpleRegressionHead
+from octcube import OCTCubeRegression, SimpleRegressionHead, apply_lora
 
 typechecked = jaxtyped(typechecker=beartype)
 
@@ -35,23 +35,23 @@ class TrainConfig:
     partial_val_interval: int = 1000  # Validation every N training steps in phase 2
     train_save_im: int = 30
     plot_losses: int = 10
+    plot_scatter_interval: int = 500  # Rolling scatter plot every N training iterations
     val_max_volumes: int = 100  # Number of volumes for partial validation
     scatter_dir: str = "scatter_plots"  # Directory for per-epoch heatmap scatters
 
     # Two-phase training
-    phase1_epochs: int = 5    # Head-only (encoder frozen)
-    phase2_epochs: int = 15   # End-to-end (encoder unfrozen with warmup)
-    encoder_lr: float = 1e-5
-    head_lr: float = 1e-3
-    phase2_head_lr: float = 1e-4  # Lower LR for head MLP in phase 2 (already pretrained)
-    phase2_pool_lr: float = 1e-4  # Pool LR — must stay close to MLP LR to avoid disrupting learned features
-    warmup_fraction: float = 0.1  # Fraction of phase 2 steps for encoder LR warmup
-    head_freeze_epochs: int = 2   # Freeze head during first N epochs of phase 2 (encoder-only warmup)
+    phase1_epochs: int = 10   # Head-only (encoder frozen)
+    phase2_epochs: int = 15   # End-to-end (LoRA + head)
+    head_lr: float = 1e-3     # Phase 1 head LR
+    phase2_lr: float = 1e-4   # Phase 2 LR for LoRA, pool, and head MLP
+    warmup_fraction: float = 0.1  # Fraction of phase 2 steps for LR warmup
     grad_accum_steps: int = 32  # Gradient accumulation steps (effective batch = batch_size * accum)
     max_grad_norm: float = 50.0  # Gradient clipping (on trainable params only)
 
-    # Phase 2 encoder unfreezing
-    unfreeze_last_n_layers: int = 1  # Unfreeze last N encoder blocks + final norm
+    # LoRA config
+    lora_last_n_blocks: int = 8   # Apply LoRA to last N encoder blocks
+    lora_rank: int = 8
+    lora_alpha: float = 8.0
 
     # Pre-extracted features for phase 1 (skip encoder forward pass entirely)
     feature_dir: str = "extracted_features"
@@ -91,8 +91,8 @@ class Metrics:
             self.data[split] = {"iterations": [], "metrics": defaultdict(list)}
         self.current_iter = 0
         self.current_epoch = 0
-        self.rolling_preds = deque(maxlen=100)
-        self.rolling_gts = deque(maxlen=100)
+        self.rolling_preds = deque(maxlen=2000)
+        self.rolling_gts = deque(maxlen=2000)
         self.eta_str = ""
 
     def append(self, split, metrics):
@@ -193,9 +193,12 @@ class Metrics:
         ax.plot([vmin, vmax], [vmin, vmax], 'r--', linewidth=1.5, label='y=x')
         mae = np.abs(preds - gts).mean()
         r = np.corrcoef(preds, gts)[0, 1] if len(preds) > 1 else 0.0
+        ss_res = np.sum((preds - gts) ** 2)
+        ss_tot = np.sum((gts - gts.mean()) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
         ax.set_xlabel('Ground Truth')
         ax.set_ylabel('Predicted')
-        ax.set_title(f'Last {len(preds)} samples (iter {self.current_iter})\nMAE={mae:.4f}  r={r:.4f}')
+        ax.set_title(f'Last {len(preds)} samples (iter {self.current_iter})\nMAE={mae:.4f}  r={r:.4f}  R\u00b2={r2:.4f}')
         ax.legend(loc='upper left', fontsize=8)
         plt.tight_layout()
         plt.savefig("rolling_scatter.png")
@@ -233,6 +236,9 @@ class Metrics:
 
     def should_plot_losses(self):
         return self.current_iter % TrainConfig.plot_losses == 0
+
+    def should_plot_scatter(self):
+        return self.current_iter % TrainConfig.plot_scatter_interval == 0
 
 
 def plot_pred_vs_gt_heatmap(preds_np, gts_np, epoch, save_dir="scatter_plots", title=""):
@@ -320,27 +326,6 @@ def load_checkpoint(model, optimizer, metrics, path):
     print(f"Loaded checkpoint from {path} (epoch {metrics.current_epoch}, iter {metrics.current_iter})")
     return True
 
-def get_warmup_scheduler(optimizer, warmup_steps):
-    """Linear warmup for encoder/pool (groups 0-1), constant for head MLP (group 2).
-
-    Three param groups expected:
-      0 = Encoder last-layer params (warmup from 0)
-      1 = AttentionPool params      (warmup from 0 — random init, never saw data in phase 1)
-      2 = Head MLP params           (constant — already pretrained in phase 1)
-    """
-    def lr_lambda_warmup(step):
-        if warmup_steps == 0:
-            return 1.0
-        if step < warmup_steps:
-            return step / warmup_steps
-        return 1.0
-
-    def lr_lambda_constant(step):
-        return 1.0
-
-    return torch.optim.lr_scheduler.LambdaLR(
-        optimizer, [lr_lambda_warmup, lr_lambda_warmup, lr_lambda_constant]
-    )
 
 
 def train_one_epoch(
@@ -405,6 +390,7 @@ def train_one_epoch(
 
         if metrics.should_plot_losses():
             metrics.plot_metrics()
+        if metrics.should_plot_scatter():
             metrics.plot_rolling_scatter()
 
         # Periodic validation
@@ -631,12 +617,12 @@ def full_supervised_run():
     print(f"Phase 1 head saved to {phase1_path}")
 
     # ----------------------------------------------------------------
-    # Phase 2: Fine-tune last encoder layer + head
+    # Phase 2: LoRA fine-tuning (encoder frozen, LoRA + head trainable)
     # ----------------------------------------------------------------
     print("=" * 60)
-    print(f"Phase 2: Last-layer fine-tuning for {TrainConfig.phase2_epochs} epochs")
-    print(f"  Unfreezing last {TrainConfig.unfreeze_last_n_layers} encoder block(s) + final norm")
-    print(f"  Encoder LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
+    print(f"Phase 2: LoRA fine-tuning for {TrainConfig.phase2_epochs} epochs")
+    print(f"  LoRA rank {TrainConfig.lora_rank} on last {TrainConfig.lora_last_n_blocks} blocks (QKV + proj)")
+    print(f"  LR warmup over first {TrainConfig.warmup_fraction:.0%} of steps")
     spatial_patches = (TrainConfig.img_size // TrainConfig.patch_size) ** 2
     temporal_patches = TrainConfig.num_frames // TrainConfig.t_patch_size
     total_tokens = spatial_patches * temporal_patches
@@ -645,7 +631,7 @@ def full_supervised_run():
         print(f"  Center crop: {TrainConfig.center_crop_frac:.0%} of W before resize")
     print("=" * 60)
 
-    # Now create the full model (encoder + head)
+    # Create full model (encoder frozen + head)
     model = OCTCubeRegression(
         img_size=TrainConfig.img_size,
         patch_size=TrainConfig.patch_size,
@@ -656,25 +642,17 @@ def full_supervised_run():
         checkpoint_path=TrainConfig.checkpoint_path,
     ).cuda()
 
-    # Load phase 1 head weights into the full model's head
+    # Load phase 1 head weights
     model.head.load_state_dict(head_state)
     print("Loaded phase 1 head weights into full model")
 
-    # Unfreeze last N encoder blocks + final LayerNorm
-    n_blocks = len(model.encoder.model.blocks)
-    n_unfreeze = TrainConfig.unfreeze_last_n_layers
-    for block in model.encoder.model.blocks[-n_unfreeze:]:
-        for p in block.parameters():
-            p.requires_grad = True
-    for p in model.encoder.model.norm.parameters():
-        p.requires_grad = True
-
-    encoder_trainable = [p for p in model.encoder.parameters() if p.requires_grad]
-    encoder_trainable_count = sum(p.numel() for p in encoder_trainable)
-    total_encoder = sum(p.numel() for p in model.encoder.parameters())
-    print(f"Unfroze last {n_unfreeze}/{n_blocks} blocks + norm: "
-          f"{encoder_trainable_count:,} trainable params "
-          f"(of {total_encoder:,} total encoder params)")
+    # Apply LoRA to last N attention blocks (encoder base weights stay frozen)
+    lora_params = apply_lora(
+        model,
+        last_n_blocks=TrainConfig.lora_last_n_blocks,
+        rank=TrainConfig.lora_rank,
+        alpha=TrainConfig.lora_alpha,
+    )
 
     model.enable_entropy(True)
 
@@ -682,96 +660,38 @@ def full_supervised_run():
     pool_params = list(model.head.pool.parameters())
     mlp_params = list(model.head.mlp.parameters())
 
-    # ------------------------------------------------------------------
-    # Phase 2a: Encoder-only warmup (head frozen)
-    # ------------------------------------------------------------------
-    hf = TrainConfig.head_freeze_epochs
-    if hf > 0:
-        print(f"\n--- Phase 2a: Encoder warmup with head frozen ({hf} epochs) ---")
-        # Freeze head
-        for p in pool_params + mlp_params:
-            p.requires_grad = False
-
-        optimizer_2a = torch.optim.AdamW([
-            {"params": encoder_trainable, "lr": TrainConfig.encoder_lr},
-        ])
-
-        steps_per_epoch = len(train_loader) // TrainConfig.grad_accum_steps
-        warmup_steps_2a = int(TrainConfig.warmup_fraction * hf * steps_per_epoch)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            scheduler_2a = torch.optim.lr_scheduler.LambdaLR(
-                optimizer_2a,
-                [lambda step, ws=warmup_steps_2a: step / max(ws, 1) if step < ws else 1.0],
-            )
-        print(f"  Encoder warmup: {warmup_steps_2a} scheduler steps over {hf} epochs")
-
-        for e in range(1, hf + 1):
-            epoch_num = TrainConfig.phase1_epochs + e
-            metrics.current_epoch = epoch_num
-            print(f"Phase 2a - Epoch {e}/{hf} (overall {epoch_num})  [head frozen]")
-            train_one_epoch(
-                model, optimizer_2a,
-                train_loader, val_loader, metrics,
-                scheduler=scheduler_2a,
-                remaining_epochs=TrainConfig.phase2_epochs - e + 1,
-            )
-
-            preds, gts = validation_partial_epoch(model, val_loader, metrics, split="val")
-            plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, "Phase 2a")
-            save_checkpoint(model, optimizer_2a, metrics, latest_path, save_encoder=True)
-
-        # Unfreeze head
-        for p in pool_params + mlp_params:
-            p.requires_grad = True
-        print("--- Head unfrozen, starting phase 2b ---\n")
-
-    # ------------------------------------------------------------------
-    # Phase 2b: Last layer + head fine-tuning
-    # ------------------------------------------------------------------
-    remaining_epochs = TrainConfig.phase2_epochs - hf
+    # Single optimizer: LoRA + pool + head MLP, all at same LR
     optimizer = torch.optim.AdamW([
-        {"params": encoder_trainable, "lr": TrainConfig.encoder_lr},
-        {"params": pool_params, "lr": TrainConfig.phase2_pool_lr},
-        {"params": mlp_params, "lr": TrainConfig.phase2_head_lr},
+        {"params": lora_params, "lr": TrainConfig.phase2_lr},
+        {"params": pool_params, "lr": TrainConfig.phase2_lr},
+        {"params": mlp_params, "lr": TrainConfig.phase2_lr},
     ])
 
-    # Warmup for pool (random init, never saw data in phase 1).
-    # Encoder last layer already warmed up in 2a so starts at full LR.
-    # Head MLP is pretrained from phase 1 so constant LR.
-    total_optimizer_steps = (remaining_epochs * len(train_loader)) // TrainConfig.grad_accum_steps
-    warmup_steps = int(TrainConfig.warmup_fraction * total_optimizer_steps) if hf == 0 else 0
+    total_optimizer_steps = (TrainConfig.phase2_epochs * len(train_loader)) // TrainConfig.grad_accum_steps
+    warmup_steps = int(TrainConfig.warmup_fraction * total_optimizer_steps)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        if hf > 0:
-            # Encoder already warm — only pool needs warmup
-            pool_warmup = int(TrainConfig.warmup_fraction * total_optimizer_steps)
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [
-                lambda step: 1.0,  # Encoder: already warm, full LR
-                lambda step, ws=pool_warmup: step / max(ws, 1) if step < ws else 1.0,  # Pool: warmup
-                lambda step: 1.0,  # MLP: constant
-            ])
-            print(f"Phase 2b: {remaining_epochs} epochs, pool warmup {pool_warmup} steps")
-        else:
-            warmup_steps = int(TrainConfig.warmup_fraction * total_optimizer_steps)
-            scheduler = get_warmup_scheduler(optimizer, warmup_steps)
-            print(f"Phase 2b: {remaining_epochs} epochs, warmup {warmup_steps} steps")
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [
+            lambda step, ws=warmup_steps: step / max(ws, 1) if step < ws else 1.0,  # LoRA: warmup
+            lambda step, ws=warmup_steps: step / max(ws, 1) if step < ws else 1.0,  # Pool: warmup
+            lambda step: 1.0,  # MLP: constant (pretrained from phase 1)
+        ])
+    print(f"Phase 2: {TrainConfig.phase2_epochs} epochs, warmup {warmup_steps} steps")
 
-    for e in range(1, remaining_epochs + 1):
-        epoch_num = TrainConfig.phase1_epochs + hf + e
+    for e in range(1, TrainConfig.phase2_epochs + 1):
+        epoch_num = TrainConfig.phase1_epochs + e
         metrics.current_epoch = epoch_num
-        phase_label = "Phase 2b" if hf > 0 else "Phase 2"
-        print(f"{phase_label} - Epoch {e}/{remaining_epochs} (overall {epoch_num})")
+        print(f"Phase 2 - Epoch {e}/{TrainConfig.phase2_epochs} (overall {epoch_num})")
         train_one_epoch(
             model, optimizer,
             train_loader, val_loader, metrics,
             scheduler=scheduler,
-            remaining_epochs=remaining_epochs - e + 1,
+            remaining_epochs=TrainConfig.phase2_epochs - e + 1,
         )
 
         # End-of-epoch validation + heatmap scatter
         preds, gts = validation_partial_epoch(model, val_loader, metrics, split="val")
-        plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, phase_label)
+        plot_pred_vs_gt_heatmap(preds, gts, epoch_num, TrainConfig.scatter_dir, "Phase 2")
 
         save_checkpoint(model, optimizer, metrics, latest_path, save_encoder=True)
 

@@ -258,6 +258,51 @@ class Mlp(nn.Module):
         return x
 
 
+class LoRALinear(nn.Module):
+    """Low-rank adapter wrapping an existing nn.Linear (frozen).
+
+    output = frozen_linear(x) + scale * (x @ A^T @ B^T)
+    where A is (rank, in), B is (out, rank), scale = alpha / rank.
+    """
+    def __init__(self, original: nn.Linear, rank: int = 8, alpha: float = 8.0):
+        super().__init__()
+        self.original = original
+        self.rank = rank
+        self.scale = alpha / rank
+        in_features = original.in_features
+        out_features = original.out_features
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # B starts at zero so LoRA contribution is zero at init
+
+    def forward(self, x):
+        base = self.original(x)
+        lora = (x @ self.lora_A.T) @ self.lora_B.T
+        return base + self.scale * lora
+
+
+def apply_lora(model, last_n_blocks: int = 8, rank: int = 8, alpha: float = 8.0):
+    """Replace qkv and proj in the last N attention blocks with LoRA-wrapped versions.
+
+    The original Linear weights stay frozen; only LoRA A/B matrices are trainable.
+    Returns list of LoRA parameters for the optimizer.
+    """
+    blocks = model.encoder.model.blocks
+    n_blocks = len(blocks)
+    lora_params = []
+    for block in blocks[-last_n_blocks:]:
+        attn = block.attn
+        attn.qkv = LoRALinear(attn.qkv, rank=rank, alpha=alpha)
+        attn.proj = LoRALinear(attn.proj, rank=rank, alpha=alpha)
+        lora_params.extend([attn.qkv.lora_A, attn.qkv.lora_B,
+                            attn.proj.lora_A, attn.proj.lora_B])
+    count = sum(p.numel() for p in lora_params)
+    print(f"LoRA applied to last {last_n_blocks}/{n_blocks} blocks "
+          f"(rank={rank}, alpha={alpha}): {count:,} trainable params")
+    return lora_params
+
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
