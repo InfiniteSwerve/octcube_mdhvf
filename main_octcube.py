@@ -348,6 +348,13 @@ def train_one_epoch(
 
     last_grad_norm = 0.0
 
+    # Accumulators for micro-batch metrics
+    accum_loss = 0.0
+    accum_pred_std = 0.0
+    accum_preds = []
+    accum_labels = []
+    accum_count = 0
+
     for batch_idx, batch in enumerate(train_dataloader):
         imgs = batch['frames']
         labels = batch['label']
@@ -359,8 +366,16 @@ def train_one_epoch(
             accum,
         )
 
+        # Accumulate micro-batch metrics
+        accum_loss += step_metrics["loss"]
+        accum_pred_std += step_metrics["pred_std"]
+        accum_preds.append(preds)
+        accum_labels.append(labels)
+        accum_count += 1
+
         # Optimizer step on accumulation boundary
-        if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches:
+        is_accum_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
+        if is_accum_boundary:
             trainable = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
             last_grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=TrainConfig.max_grad_norm).item()
             optimizer.step()
@@ -368,35 +383,51 @@ def train_one_epoch(
             if scheduler is not None:
                 scheduler.step()
 
-        # ETA calculation
-        elapsed = time.time() - epoch_start
-        steps_done = batch_idx + 1
-        secs_per_step = elapsed / steps_done
-        epoch_remaining = secs_per_step * (total_batches - steps_done)
-        total_remaining = epoch_remaining + secs_per_step * total_batches * (remaining_epochs - 1)
-        metrics.eta_str = (
-            f"batch {steps_done}/{total_batches} | "
-            f"{_format_time(elapsed)} elapsed, ETA {_format_time(total_remaining)}"
-        )
+            # Log averaged metrics for this optimizer step
+            avg_metrics = {
+                "loss": accum_loss / accum_count,
+                "pred_std": accum_pred_std / accum_count,
+            }
 
-        metrics.append_regression(preds, labels)
-        step_metrics.update(metrics.get_regression_metrics())
-        step_metrics["grad_norm_preclip"] = last_grad_norm
-        if hasattr(model, 'get_last_block_entropy'):
-            ent = model.get_last_block_entropy()
-            if ent is not None:
-                step_metrics["attn_entropy"] = ent
-        metrics.append("train", step_metrics)
+            all_preds = torch.cat(accum_preds)
+            all_labels = torch.cat(accum_labels)
+            metrics.append_regression(all_preds, all_labels)
+            avg_metrics.update(metrics.get_regression_metrics())
+            avg_metrics["grad_norm_preclip"] = last_grad_norm
+            if hasattr(model, 'get_last_block_entropy'):
+                ent = model.get_last_block_entropy()
+                if ent is not None:
+                    avg_metrics["attn_entropy"] = ent
 
-        if metrics.should_plot_losses():
-            metrics.plot_metrics()
-        if metrics.should_plot_scatter():
-            metrics.plot_rolling_scatter()
+            # ETA calculation
+            elapsed = time.time() - epoch_start
+            steps_done = batch_idx + 1
+            secs_per_step = elapsed / steps_done
+            epoch_remaining = secs_per_step * (total_batches - steps_done)
+            total_remaining = epoch_remaining + secs_per_step * total_batches * (remaining_epochs - 1)
+            metrics.eta_str = (
+                f"batch {steps_done}/{total_batches} | "
+                f"{_format_time(elapsed)} elapsed, ETA {_format_time(total_remaining)}"
+            )
 
-        # Periodic validation
-        if metrics.current_iter % TrainConfig.partial_val_interval == 0:
-            validation_partial_epoch(model, val_dataloader, metrics)
-            model.encoder.eval()
+            metrics.append("train", avg_metrics)
+
+            # Reset accumulators
+            accum_loss = 0.0
+            accum_pred_std = 0.0
+            accum_preds = []
+            accum_labels = []
+            accum_count = 0
+
+            if metrics.should_plot_losses():
+                metrics.plot_metrics()
+            if metrics.should_plot_scatter():
+                metrics.plot_rolling_scatter()
+
+            # Periodic validation
+            if metrics.current_iter % TrainConfig.partial_val_interval == 0:
+                validation_partial_epoch(model, val_dataloader, metrics)
+                model.encoder.eval()
 
 
 
