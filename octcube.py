@@ -271,8 +271,10 @@ class LoRALinear(nn.Module):
         self.scale = alpha / rank
         in_features = original.in_features
         out_features = original.out_features
-        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        device = original.weight.device
+        dtype = original.weight.dtype
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features, device=device, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, device=device, dtype=dtype))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         # B starts at zero so LoRA contribution is zero at init
 
