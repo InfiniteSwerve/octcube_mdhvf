@@ -410,8 +410,9 @@ def one_training_step(
 ) -> tuple[dict[str, float], Tensor]:
     """Single micro-step: forward + backward (no optimizer step).
     Returns (metrics, preds) for diagnostics."""
-    pred = model(images.cuda()).float()
-    loss = F.mse_loss(pred, labels.cuda().float())
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        pred = model(images.cuda()).float()
+        loss = F.mse_loss(pred, labels.cuda().float())
     scaled_loss = loss / accum_steps
 
     scaled_loss.backward()
@@ -433,7 +434,7 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split="val_par
     num_batches = 0
     num_vols = 0
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         for batch in dataloader:
             if num_vols >= max_vols:
                 break
