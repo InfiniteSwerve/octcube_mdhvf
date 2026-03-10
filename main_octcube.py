@@ -34,8 +34,8 @@ class TrainConfig:
     step_size: int = 48  # Number of slices per volume chunk (must be divisible by t_patch_size=3)
     partial_val_interval: int = 1000  # Validation every N training steps in phase 2
     train_save_im: int = 30
-    plot_losses: int = 500
-    plot_scatter_interval: int = 500  # Rolling scatter plot every N training iterations
+    plot_losses: int = 10
+    plot_scatter_interval: int = 10  # Rolling scatter plot every N optimizer steps
     val_max_volumes: int = 100  # Number of volumes for partial validation
     scatter_dir: str = "scatter_plots"  # Directory for per-epoch heatmap scatters
 
