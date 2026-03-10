@@ -34,7 +34,7 @@ class TrainConfig:
     step_size: int = 48  # Number of slices per volume chunk (must be divisible by t_patch_size=3)
     partial_val_interval: int = 1000  # Validation every N training steps in phase 2
     train_save_im: int = 30
-    plot_losses: int = 10
+    plot_losses: int = 500
     plot_scatter_interval: int = 500  # Rolling scatter plot every N training iterations
     val_max_volumes: int = 100  # Number of volumes for partial validation
     scatter_dir: str = "scatter_plots"  # Directory for per-epoch heatmap scatters
@@ -65,7 +65,7 @@ class TrainConfig:
     model_size: str = 'large'
     center_crop_frac: float = 0.5  # Crop to center 50% of W before resize (None to disable)
     phase1_batch_size: int = 2   # Phase 1 (features only)
-    phase2_batch_size: int = 1   # Phase 2 (full model, encoder partially unfrozen)
+    phase2_batch_size: int = 2   # Phase 2 (LoRA + head, encoder frozen)
     num_workers: int = 25
 
     # Paths
