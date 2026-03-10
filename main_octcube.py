@@ -44,7 +44,7 @@ class TrainConfig:
     phase2_epochs: int = 15   # End-to-end (LoRA + head)
     head_lr: float = 1e-3     # Phase 1 head LR
     phase2_lr: float = 1e-4   # Phase 2 LR for LoRA, pool, and head MLP
-    warmup_fraction: float = 0.1  # Fraction of phase 2 steps for LR warmup
+    warmup_fraction: float = 0.0  # Fraction of phase 2 steps for LR warmup (0 = disabled)
     grad_accum_steps: int = 32  # Gradient accumulation steps (effective batch = batch_size * accum)
     max_grad_norm: float = 50.0  # Gradient clipping (on trainable params only)
 
