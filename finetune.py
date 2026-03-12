@@ -52,7 +52,6 @@ class Config:
     layer_decay: float = 0.75   # LR multiplier per layer (earlier = smaller LR)
     min_lr: float = 1e-6
     warmup_epochs: int = 5
-    max_grad_norm: float = 1.0
 
     # Head
     dropout: float = 0.5
@@ -244,7 +243,7 @@ class Metrics:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         for split, color in [("train", "C0"), ("val", "C1")]:
             iters = self.data[split]["iterations"]
-            for ax, key in zip(axes.flat, ["loss", "mae", "pearson_r", "grad_norm"]):
+            for ax, key in zip(axes.flat, ["loss", "mae", "pearson_r", "lr"]):
                 vals = self.data[split]["metrics"].get(key, [])
                 if vals and len(vals) == len(iters):
                     ax.plot(iters, vals, color=color, alpha=0.6, label=split, linewidth=0.8)
@@ -413,8 +412,6 @@ def train():
 
             is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
             if is_boundary:
-                trainable = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-                grad_norm = torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm).item()
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
@@ -427,7 +424,6 @@ def train():
 
                 log = {
                     "loss": accum_loss / accum_count,
-                    "grad_norm": grad_norm,
                     "lr": optimizer.param_groups[-1]["lr"],
                     **reg,
                 }
