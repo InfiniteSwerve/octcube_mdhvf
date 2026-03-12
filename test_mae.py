@@ -18,7 +18,7 @@ OUT_DIR = "mae_reconstructions"
 @dataclass
 class MAETestConfig:
     checkpoint_path: str = "/storage2/fs1/leeay/Active/jstrand/projects/OCTCubeM/ckpt/OCTCube.pth"
-    img_size: int = 384
+    img_size: int = 256
     patch_size: int = 16
     num_frames: int = 48
     t_patch_size: int = 3

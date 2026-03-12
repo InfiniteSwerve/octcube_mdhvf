@@ -58,7 +58,7 @@ class TrainConfig:
     feature_pool: str = "mean_raw"  # Must match AttentionPool init (mean pool at start)
 
     # Model parameters
-    img_size: int = 384         # Reduced from 512: 24x24=576 spatial patches (vs 32x32=1024)
+    img_size: int = 256         # Match pretraining default: 16x16=256 spatial patches (no pos_embed interpolation)
     patch_size: int = 16
     num_frames: int = 48
     t_patch_size: int = 3

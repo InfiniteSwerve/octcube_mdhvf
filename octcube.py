@@ -536,10 +536,6 @@ class OCTCubeViT(nn.Module):
 
         self.norm = norm_layer(embed_dim)
 
-        # For global pooling
-        if global_pool:
-            self.fc_norm = norm_layer(embed_dim)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -621,9 +617,8 @@ class OCTCubeViT(nn.Module):
         for blk in self.blocks:
             x = blk(x)
 
-        x = self.norm(x)
-
         if return_all_tokens:
+            x = self.norm(x)
             # Remove cls token and reshape back to (B, T, L, D)
             if self.cls_embed:
                 x = x[:, 1:]
@@ -636,8 +631,9 @@ class OCTCubeViT(nn.Module):
                     x = x[:, 1:].mean(dim=1)
                 else:
                     x = x.mean(dim=1)
-                x = self.fc_norm(x)
+                x = self.norm(x)
             else:
+                x = self.norm(x)
                 # Use cls token
                 x = x[:, 0]
             return x
