@@ -233,18 +233,22 @@ class Metrics:
 
     def get_regression_metrics(self):
         if len(self.rolling_preds) < 10:
-            return {"mae": 0, "pearson_r": 0}
+            return {"mae": 0, "pearson_r": 0, "r2": 0}
         p = np.array(self.rolling_preds)
         g = np.array(self.rolling_gts)
         mae = np.abs(p - g).mean()
         r = np.corrcoef(p, g)[0, 1] if np.std(p) > 1e-8 else 0.0
-        return {"mae": float(mae), "pearson_r": float(r)}
+        ss_res = ((p - g) ** 2).sum()
+        ss_tot = ((g - g.mean()) ** 2).sum()
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        return {"mae": float(mae), "pearson_r": float(r), "r2": float(r2)}
 
     def plot(self):
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        keys = ["loss", "mae", "pearson_r", "r2", "lr", "pred_std"]
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         for split, color in [("train", "C0"), ("val", "C1")]:
             iters = self.data[split]["iterations"]
-            for ax, key in zip(axes.flat, ["loss", "mae", "pearson_r", "lr"]):
+            for ax, key in zip(axes.flat, keys):
                 vals = self.data[split]["metrics"].get(key, [])
                 if vals and len(vals) == len(iters):
                     ax.plot(iters, vals, color=color, alpha=0.6, label=split, linewidth=0.8)
@@ -255,23 +259,41 @@ class Metrics:
         plt.savefig("finetune_metrics.png", dpi=120)
         plt.close()
 
-    def plot_scatter(self):
-        if len(self.rolling_preds) < 20:
+    def plot_scatter(self, val_preds=None, val_gts=None):
+        """Plot rolling train scatter and optional validation scatter side by side."""
+        has_train = len(self.rolling_preds) >= 20
+        has_val = val_preds is not None and len(val_preds) >= 10
+        ncols = has_train + has_val
+        if ncols == 0:
             return
-        p = np.array(self.rolling_preds)
-        g = np.array(self.rolling_gts)
-        mae = np.abs(p - g).mean()
-        r = np.corrcoef(p, g)[0, 1] if np.std(p) > 1e-8 else 0.0
-        fig, ax = plt.subplots(figsize=(5, 5))
-        ax.scatter(g, p, s=4, alpha=0.4)
-        lo, hi = min(g.min(), p.min()), max(g.max(), p.max())
-        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1)
-        ax.set_xlabel("GT")
-        ax.set_ylabel("Pred")
-        ax.set_title(f"Rolling (n={len(p)}) MAE={mae:.4f} r={r:.4f}")
+        fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols, 5))
+        if ncols == 1:
+            axes = [axes]
+        col = 0
+        if has_train:
+            p = np.array(self.rolling_preds)
+            g = np.array(self.rolling_gts)
+            self._scatter_panel(axes[col], g, p, f"Train rolling (n={len(p)})")
+            col += 1
+        if has_val:
+            self._scatter_panel(axes[col], val_gts, val_preds, f"Validation (n={len(val_preds)})")
         fig.tight_layout()
         plt.savefig("finetune_scatter.png", dpi=120)
         plt.close()
+
+    @staticmethod
+    def _scatter_panel(ax, gt, pred, title):
+        mae = np.abs(pred - gt).mean()
+        r = np.corrcoef(pred, gt)[0, 1] if np.std(pred) > 1e-8 else 0.0
+        ss_res = ((pred - gt) ** 2).sum()
+        ss_tot = ((gt - gt.mean()) ** 2).sum()
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        ax.scatter(gt, pred, s=4, alpha=0.4)
+        lo, hi = min(gt.min(), pred.min()), max(gt.max(), pred.max())
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1)
+        ax.set_xlabel("GT")
+        ax.set_ylabel("Pred")
+        ax.set_title(f"{title}\nMAE={mae:.4f}  r={r:.4f}  R²={r2:.4f}")
 
     def save(self, path):
         import json
@@ -457,9 +479,10 @@ def train():
                     metrics.plot_scatter()
 
                 if metrics.opt_step % cfg.val_interval == 0:
-                    val_metrics, _, _ = validate(model, val_loader, cfg)
+                    val_metrics, vp, vg = validate(model, val_loader, cfg)
                     metrics.append("val", val_metrics)
                     metrics.plot()
+                    metrics.plot_scatter(val_preds=vp, val_gts=vg)
                     model.train()
 
         # End-of-epoch validation
@@ -470,7 +493,7 @@ def train():
               f"r2={val_metrics['r2']:.4f}")
 
         metrics.plot()
-        metrics.plot_scatter()
+        metrics.plot_scatter(val_preds=val_preds, val_gts=val_gts)
         metrics.save(os.path.join(cfg.save_dir, "metrics.json"))
         save_checkpoint(model, optimizer, scheduler, metrics,
                         os.path.join(cfg.save_dir, "latest.pt"))
