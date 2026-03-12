@@ -16,6 +16,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Optional
 from collections import deque, defaultdict
+from tqdm import tqdm
 
 from torch import Tensor
 from jaxtyping import Float, jaxtyped
@@ -401,7 +402,8 @@ def train():
         epoch_start = time.time()
         total_batches = len(train_loader)
 
-        for batch_idx, batch in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs}", leave=True)
+        for batch_idx, batch in enumerate(pbar):
             step_metrics, preds = forward_step(
                 batch["frames"], batch["label"], model, accum,
             )
@@ -409,6 +411,10 @@ def train():
             accum_preds.append(preds)
             accum_labels.append(batch["label"])
             accum_count += 1
+
+            pbar.set_postfix_str(
+                f"micro={accum_count}/{accum} loss={step_metrics['loss']:.4f}", refresh=False
+            )
 
             is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
             if is_boundary:
@@ -422,12 +428,18 @@ def train():
                 metrics.append_regression(all_p, all_l)
                 reg = metrics.get_regression_metrics()
 
+                avg_loss = accum_loss / accum_count
                 log = {
-                    "loss": accum_loss / accum_count,
+                    "loss": avg_loss,
                     "lr": optimizer.param_groups[-1]["lr"],
                     **reg,
                 }
                 metrics.append("train", log)
+
+                pbar.set_postfix_str(
+                    f"loss={avg_loss:.4f} mae={reg['mae']:.4f} r={reg['pearson_r']:.3f}",
+                    refresh=True,
+                )
 
                 # ETA
                 elapsed = time.time() - epoch_start
