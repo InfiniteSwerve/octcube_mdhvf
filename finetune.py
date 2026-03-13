@@ -256,10 +256,12 @@ class Metrics:
         self.epoch = 0
         self.rolling_preds = deque(maxlen=2000)
         self.rolling_gts = deque(maxlen=2000)
+        self.rolling_val_preds = deque(maxlen=2000)
+        self.rolling_val_gts = deque(maxlen=2000)
         self.eta_str = ""
         self.best_val_r2 = -float("inf")
-        self._last_val_preds = None
-        self._last_val_gts = None
+        self._full_val_preds = None
+        self._full_val_gts = None
 
     def append(self, split, metrics_dict):
         self.data[split]["iterations"].append(self.opt_step)
@@ -300,28 +302,38 @@ class Metrics:
         plt.savefig("finetune_metrics.png", dpi=120)
         plt.close()
 
-    def plot_scatter(self, val_preds=None, val_gts=None):
-        """Plot rolling train scatter and validation scatter side by side."""
-        if val_preds is not None and len(val_preds) >= 10:
-            self._last_val_preds = val_preds
-            self._last_val_gts = val_gts
-        has_train = len(self.rolling_preds) >= 20
-        has_val = self._last_val_preds is not None
-        ncols = has_train + has_val
-        if ncols == 0:
+    def append_val_regression(self, preds, gts):
+        """Append to rolling validation scatter from periodic val checks."""
+        if isinstance(preds, np.ndarray):
+            preds = preds.tolist()
+            gts = gts.tolist()
+        self.rolling_val_preds.extend(preds)
+        self.rolling_val_gts.extend(gts)
+
+    def set_full_val(self, preds, gts):
+        """Store full end-of-epoch validation results."""
+        self._full_val_preds = preds
+        self._full_val_gts = gts
+
+    def plot_scatter(self):
+        """Plot up to 3 panels: rolling train, rolling val, full epoch val."""
+        panels = []
+        if len(self.rolling_preds) >= 20:
+            panels.append((np.array(self.rolling_gts), np.array(self.rolling_preds),
+                           f"Train rolling (n={len(self.rolling_preds)})"))
+        if len(self.rolling_val_preds) >= 10:
+            panels.append((np.array(self.rolling_val_gts), np.array(self.rolling_val_preds),
+                           f"Val rolling (n={len(self.rolling_val_preds)})"))
+        if self._full_val_preds is not None:
+            panels.append((self._full_val_gts, self._full_val_preds,
+                           f"Val full epoch (n={len(self._full_val_preds)})"))
+        if not panels:
             return
-        fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols, 5))
-        if ncols == 1:
+        fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 5))
+        if len(panels) == 1:
             axes = [axes]
-        col = 0
-        if has_train:
-            p = np.array(self.rolling_preds)
-            g = np.array(self.rolling_gts)
-            self._scatter_panel(axes[col], g, p, f"Train rolling (n={len(p)})")
-            col += 1
-        if has_val:
-            vp, vg = self._last_val_preds, self._last_val_gts
-            self._scatter_panel(axes[col], vg, vp, f"Validation (n={len(vp)})")
+        for ax, (gt, pred, title) in zip(axes, panels):
+            self._scatter_panel(ax, gt, pred, title)
         fig.tight_layout()
         plt.savefig("finetune_scatter.png", dpi=120)
         plt.close()
@@ -567,10 +579,11 @@ def train():
 
                 if metrics.opt_step % cfg.val_interval == 0:
                     if _is_main():
-                        val_metrics, vp, vg = validate(model, val_loader, cfg)
+                        val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                         metrics.append("val", val_metrics)
+                        metrics.append_val_regression(vp, vg)
                         metrics.plot()
-                        metrics.plot_scatter(val_preds=vp, val_gts=vg)
+                        metrics.plot_scatter()
                         if val_metrics["r2"] > metrics.best_val_r2:
                             metrics.best_val_r2 = val_metrics["r2"]
                             save_checkpoint(model, optimizer, scheduler, metrics,
@@ -589,8 +602,9 @@ def train():
                   f"mae={val_metrics['mae']:.4f}  r={val_metrics['pearson_r']:.4f}  "
                   f"r2={val_metrics['r2']:.4f}")
 
+            metrics.set_full_val(val_preds, val_gts)
             metrics.plot()
-            metrics.plot_scatter(val_preds=val_preds, val_gts=val_gts)
+            metrics.plot_scatter()
             metrics.save(os.path.join(cfg.save_dir, "metrics.json"))
             save_checkpoint(model, optimizer, scheduler, metrics,
                             os.path.join(cfg.save_dir, "latest.pt"))
