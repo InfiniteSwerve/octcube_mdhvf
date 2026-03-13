@@ -567,7 +567,7 @@ def train():
 
                 if metrics.opt_step % cfg.val_interval == 0:
                     if _is_main():
-                        val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
+                        val_metrics, vp, vg = validate(model, val_loader, cfg)
                         metrics.append("val", val_metrics)
                         metrics.plot()
                         metrics.plot_scatter(val_preds=vp, val_gts=vg)
