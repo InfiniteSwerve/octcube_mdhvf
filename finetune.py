@@ -373,7 +373,7 @@ def forward_step(
     return {"loss": loss.item(), "pred_std": pred.detach().std().item()}, pred.detach().cpu()
 
 
-def validate(model, loader, cfg: Config):
+def validate(model, loader, cfg: Config, max_volumes: int | None = None):
     eval_model = model.module if isinstance(model, DDP) else model
     eval_model.eval()
     device = next(eval_model.parameters()).device
@@ -381,7 +381,7 @@ def validate(model, loader, cfg: Config):
     total_loss, n = 0.0, 0
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         for batch in loader:
-            if n >= cfg.val_max_volumes:
+            if max_volumes is not None and n >= max_volumes:
                 break
             imgs = batch["frames"].to(device)
             labels = batch["label"].to(device)
@@ -567,7 +567,7 @@ def train():
 
                 if metrics.opt_step % cfg.val_interval == 0:
                     if _is_main():
-                        val_metrics, vp, vg = validate(model, val_loader, cfg)
+                        val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                         metrics.append("val", val_metrics)
                         metrics.plot()
                         metrics.plot_scatter(val_preds=vp, val_gts=vg)
