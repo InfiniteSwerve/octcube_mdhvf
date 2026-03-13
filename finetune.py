@@ -391,8 +391,11 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
     device = next(eval_model.parameters()).device
     all_preds, all_labels = [], []
     total_loss, n = 0.0, 0
+    total_batches = len(loader) if max_volumes is None else min(len(loader), max_volumes)
+    pbar = tqdm(loader, total=total_batches, desc="Validating",
+                disable=not _is_main(), leave=False)
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        for batch in loader:
+        for batch in pbar:
             if max_volumes is not None and n >= max_volumes:
                 break
             imgs = batch["frames"].to(device)
@@ -402,6 +405,8 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
             all_preds.append(pred.cpu())
             all_labels.append(batch["label"])
             n += imgs.shape[0]
+            if _is_main():
+                pbar.set_postfix_str(f"loss={total_loss/n:.4f} n={n}", refresh=False)
     preds = torch.cat(all_preds)
     gts = torch.cat(all_labels)
     mae = (preds - gts).abs().mean().item()
