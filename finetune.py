@@ -432,6 +432,8 @@ def train():
     # Scale grad_accum down by world_size to keep same effective batch size
     # but finish faster.  effective_batch = batch_size * grad_accum * world_size
     cfg.grad_accum_steps = max(1, cfg.grad_accum_steps // world)
+    # Scale workers down so total across ranks doesn't exceed CPU count
+    cfg.num_workers = max(1, cfg.num_workers // world)
     accum = cfg.grad_accum_steps
 
     if _is_main():
