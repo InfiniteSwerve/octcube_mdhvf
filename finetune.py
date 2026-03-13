@@ -578,8 +578,9 @@ def train():
                     metrics.plot_scatter()
 
                 if metrics.opt_step % cfg.val_interval == 0:
+                    # All ranks run validation to avoid NCCL timeout
+                    val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                     if _is_main():
-                        val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                         metrics.append("val", val_metrics)
                         metrics.append_val_regression(vp, vg)
                         metrics.plot()
@@ -589,14 +590,13 @@ def train():
                             save_checkpoint(model, optimizer, scheduler, metrics,
                                             os.path.join(cfg.save_dir, "best.pt"))
                             print(f"  New best val R²={val_metrics['r2']:.4f}")
-                    # Sync all ranks so non-rank-0 don't race ahead during val
                     if _is_distributed():
                         dist.barrier()
                     model.train()
 
-        # End-of-epoch validation (rank 0 only; others wait at barrier)
+        # End-of-epoch full validation (all ranks run to avoid NCCL timeout)
+        val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
         if _is_main():
-            val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
             metrics.append("val", val_metrics)
             print(f"Epoch {epoch}/{cfg.epochs}  val_loss={val_metrics['loss']:.5f}  "
                   f"mae={val_metrics['mae']:.4f}  r={val_metrics['pearson_r']:.4f}  "
