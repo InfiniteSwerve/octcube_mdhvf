@@ -219,6 +219,9 @@ class Metrics:
         self.rolling_preds = deque(maxlen=2000)
         self.rolling_gts = deque(maxlen=2000)
         self.eta_str = ""
+        self.best_val_r2 = -float("inf")
+        self._last_val_preds = None
+        self._last_val_gts = None
 
     def append(self, split, metrics_dict):
         self.data[split]["iterations"].append(self.opt_step)
@@ -260,9 +263,12 @@ class Metrics:
         plt.close()
 
     def plot_scatter(self, val_preds=None, val_gts=None):
-        """Plot rolling train scatter and optional validation scatter side by side."""
+        """Plot rolling train scatter and validation scatter side by side."""
+        if val_preds is not None and len(val_preds) >= 10:
+            self._last_val_preds = val_preds
+            self._last_val_gts = val_gts
         has_train = len(self.rolling_preds) >= 20
-        has_val = val_preds is not None and len(val_preds) >= 10
+        has_val = self._last_val_preds is not None
         ncols = has_train + has_val
         if ncols == 0:
             return
@@ -276,7 +282,8 @@ class Metrics:
             self._scatter_panel(axes[col], g, p, f"Train rolling (n={len(p)})")
             col += 1
         if has_val:
-            self._scatter_panel(axes[col], val_gts, val_preds, f"Validation (n={len(val_preds)})")
+            vp, vg = self._last_val_preds, self._last_val_gts
+            self._scatter_panel(axes[col], vg, vp, f"Validation (n={len(vp)})")
         fig.tight_layout()
         plt.savefig("finetune_scatter.png", dpi=120)
         plt.close()
@@ -483,6 +490,11 @@ def train():
                     metrics.append("val", val_metrics)
                     metrics.plot()
                     metrics.plot_scatter(val_preds=vp, val_gts=vg)
+                    if val_metrics["r2"] > metrics.best_val_r2:
+                        metrics.best_val_r2 = val_metrics["r2"]
+                        save_checkpoint(model, optimizer, scheduler, metrics,
+                                        os.path.join(cfg.save_dir, "best.pt"))
+                        print(f"  New best val R²={val_metrics['r2']:.4f}")
                     model.train()
 
         # End-of-epoch validation
@@ -497,6 +509,11 @@ def train():
         metrics.save(os.path.join(cfg.save_dir, "metrics.json"))
         save_checkpoint(model, optimizer, scheduler, metrics,
                         os.path.join(cfg.save_dir, "latest.pt"))
+        if val_metrics["r2"] > metrics.best_val_r2:
+            metrics.best_val_r2 = val_metrics["r2"]
+            save_checkpoint(model, optimizer, scheduler, metrics,
+                            os.path.join(cfg.save_dir, "best.pt"))
+            print(f"  New best val R²={val_metrics['r2']:.4f}")
         model.train()
 
     print("Training complete.")
