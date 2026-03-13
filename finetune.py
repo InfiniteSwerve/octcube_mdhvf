@@ -3,12 +3,19 @@ End-to-end fine-tuning of OCTCube for HVF MTD regression.
 
 All encoder layers unfrozen with layer-wise learning rate decay (LLRD).
 Linear head with dropout, matching the official OCTCubeM fine-tuning recipe.
+
+Launch:  torchrun --nproc_per_node=4 finetune.py
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import os
 import time
@@ -27,6 +34,35 @@ from octcube import OCTCubeWrapper
 from dataset import HVFDataset
 
 typechecked = jaxtyped(typechecker=beartype)
+
+
+def _is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def _rank():
+    return dist.get_rank() if _is_distributed() else 0
+
+
+def _world_size():
+    return dist.get_world_size() if _is_distributed() else 1
+
+
+def _is_main():
+    return _rank() == 0
+
+
+def _setup_distributed():
+    """Initialize DDP if launched via torchrun."""
+    if "RANK" not in os.environ:
+        return  # single-GPU fallback
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+
+def _cleanup_distributed():
+    if _is_distributed():
+        dist.destroy_process_group()
 
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -95,9 +131,10 @@ def build_param_groups(encoder: OCTCubeWrapper, head: nn.Module, cfg: Config):
     - lr_scale = layer_decay^(num_layers - layer_id)
     - No weight decay on biases, LayerNorm, pos_embed, cls_token.
     """
-    eff_batch = cfg.batch_size * cfg.grad_accum_steps
+    eff_batch = cfg.batch_size * cfg.grad_accum_steps * _world_size()
     lr = cfg.base_lr * eff_batch / 256
-    print(f"Effective LR: {cfg.base_lr} * {eff_batch}/256 = {lr:.6f}")
+    if _is_main():
+        print(f"Effective LR: {cfg.base_lr} * {eff_batch}/256 = {lr:.6f}")
 
     num_layers = len(encoder.model.blocks)
     no_decay_keywords = {"bias", "pos_embed", "cls_token"}
@@ -146,10 +183,11 @@ def build_param_groups(encoder: OCTCubeWrapper, head: nn.Module, cfg: Config):
 
     # Print summary
     total_params = sum(p.numel() for g in param_groups for p in g["params"])
-    print(f"Optimizer: {len(param_groups)} param groups, {total_params:,} trainable params")
-    for g in sorted(param_groups, key=lambda g: g["lr"]):
-        n = sum(p.numel() for p in g["params"])
-        print(f"  {g.get('name', 'head'):30s}  lr={g['lr']:.2e}  wd={g['weight_decay']:.3f}  params={n:>10,}")
+    if _is_main():
+        print(f"Optimizer: {len(param_groups)} param groups, {total_params:,} trainable params")
+        for g in sorted(param_groups, key=lambda g: g["lr"]):
+            n = sum(p.numel() for p in g["params"])
+            print(f"  {g.get('name', 'head'):30s}  lr={g['lr']:.2e}  wd={g['weight_decay']:.3f}  params={n:>10,}")
 
     return param_groups, lr
 
@@ -327,24 +365,27 @@ def forward_step(
     model: nn.Module,
     accum: int,
 ) -> tuple[dict[str, float], Tensor]:
+    device = next(model.parameters()).device
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        pred = model(images.cuda()).float()
-        loss = F.mse_loss(pred, labels.cuda().float())
+        pred = model(images.to(device)).float()
+        loss = F.mse_loss(pred, labels.to(device).float())
     (loss / accum).backward()
-    return {"loss": loss.item(), "pred_std": pred.detach().std().item()}, pred.detach()
+    return {"loss": loss.item(), "pred_std": pred.detach().std().item()}, pred.detach().cpu()
 
 
 def validate(model, loader, cfg: Config):
-    model.eval()
+    eval_model = model.module if isinstance(model, DDP) else model
+    eval_model.eval()
+    device = next(eval_model.parameters()).device
     all_preds, all_labels = [], []
     total_loss, n = 0.0, 0
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         for batch in loader:
             if n >= cfg.val_max_volumes:
                 break
-            imgs = batch["frames"].cuda()
-            labels = batch["label"].cuda()
-            pred = model(imgs).float()
+            imgs = batch["frames"].to(device)
+            labels = batch["label"].to(device)
+            pred = eval_model(imgs).float()
             total_loss += F.mse_loss(pred, labels.float()).item()
             all_preds.append(pred.cpu())
             all_labels.append(batch["label"])
@@ -366,9 +407,12 @@ def validate(model, loader, cfg: Config):
 
 
 def save_checkpoint(model, optimizer, scheduler, metrics, path):
+    if not _is_main():
+        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    raw_model = model.module if isinstance(model, DDP) else model
     torch.save({
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "opt_step": metrics.opt_step,
@@ -378,9 +422,21 @@ def save_checkpoint(model, optimizer, scheduler, metrics, path):
 
 
 def train():
+    _setup_distributed()
+    rank = _rank()
+    world = _world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
+
     cfg = Config()
-    os.makedirs(cfg.save_dir, exist_ok=True)
-    os.makedirs(cfg.scatter_dir, exist_ok=True)
+    # Scale grad_accum down by world_size to keep same effective batch size
+    # but finish faster.  effective_batch = batch_size * grad_accum * world_size
+    cfg.grad_accum_steps = max(1, cfg.grad_accum_steps // world)
+    accum = cfg.grad_accum_steps
+
+    if _is_main():
+        os.makedirs(cfg.save_dir, exist_ok=True)
+        os.makedirs(cfg.scatter_dir, exist_ok=True)
 
     # Data
     ds_kwargs = dict(
@@ -388,40 +444,59 @@ def train():
         normalize=True,
         center_crop_frac=cfg.center_crop_frac,
     )
+    train_ds = HVFDataset(split_label="train", **ds_kwargs)
+    val_ds = HVFDataset(split_label="val", **ds_kwargs)
+
+    train_sampler = DistributedSampler(train_ds, num_replicas=world, rank=rank,
+                                       shuffle=True) if world > 1 else None
     train_loader = torch.utils.data.DataLoader(
-        HVFDataset(split_label="train", **ds_kwargs),
-        batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
     )
     val_loader = torch.utils.data.DataLoader(
-        HVFDataset(split_label="val", **ds_kwargs),
-        batch_size=cfg.batch_size, num_workers=cfg.num_workers,
+        val_ds,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
     )
 
     # Model
-    model = OCTCubeFinetune(cfg).cuda()
+    model = OCTCubeFinetune(cfg).to(device)
 
-    # Optimizer with LLRD
+    # Optimizer with LLRD (build before DDP wrap so param names don't have "module." prefix)
     param_groups, lr = build_param_groups(model.encoder, model.head, cfg)
     optimizer = torch.optim.AdamW(param_groups)
 
+    # Wrap in DDP
+    if world > 1:
+        model = DDP(model, device_ids=[local_rank])
+
     # Scheduler
-    opt_steps_per_epoch = len(train_loader) // cfg.grad_accum_steps
+    opt_steps_per_epoch = len(train_loader) // accum
     scheduler = build_scheduler(optimizer, cfg, opt_steps_per_epoch)
 
     metrics = Metrics()
-    accum = cfg.grad_accum_steps
 
-    print("=" * 60)
-    print(f"Fine-tuning OCTCube-{cfg.model_size} end-to-end")
-    print(f"  img_size={cfg.img_size}, batch={cfg.batch_size}, accum={accum}")
-    print(f"  epochs={cfg.epochs}, warmup={cfg.warmup_epochs}")
-    print(f"  base_lr={cfg.base_lr}, eff_lr={lr:.6f}, layer_decay={cfg.layer_decay}")
-    print(f"  weight_decay={cfg.weight_decay}, dropout={cfg.dropout}")
-    print(f"  {len(train_loader)} batches/epoch, {opt_steps_per_epoch} opt steps/epoch")
-    print("=" * 60)
+    if _is_main():
+        eff_batch = cfg.batch_size * accum * world
+        print("=" * 60)
+        print(f"Fine-tuning OCTCube-{cfg.model_size} end-to-end  ({world} GPU{'s' if world > 1 else ''})")
+        print(f"  img_size={cfg.img_size}, batch/gpu={cfg.batch_size}, accum={accum}, world={world}")
+        print(f"  effective_batch={eff_batch}")
+        print(f"  epochs={cfg.epochs}, warmup={cfg.warmup_epochs}")
+        print(f"  base_lr={cfg.base_lr}, eff_lr={lr:.6f}, layer_decay={cfg.layer_decay}")
+        print(f"  weight_decay={cfg.weight_decay}, dropout={cfg.dropout}")
+        print(f"  {len(train_loader)} batches/epoch, {opt_steps_per_epoch} opt steps/epoch")
+        print("=" * 60)
 
     for epoch in range(1, cfg.epochs + 1):
         metrics.epoch = epoch
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad()
 
@@ -431,7 +506,8 @@ def train():
         epoch_start = time.time()
         total_batches = len(train_loader)
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs}", leave=True)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs}",
+                    leave=True, disable=not _is_main())
         for batch_idx, batch in enumerate(pbar):
             step_metrics, preds = forward_step(
                 batch["frames"], batch["label"], model, accum,
@@ -441,9 +517,10 @@ def train():
             accum_labels.append(batch["label"])
             accum_count += 1
 
-            pbar.set_postfix_str(
-                f"micro={accum_count}/{accum} loss={step_metrics['loss']:.4f}", refresh=False
-            )
+            if _is_main():
+                pbar.set_postfix_str(
+                    f"micro={accum_count}/{accum} loss={step_metrics['loss']:.4f}", refresh=False
+                )
 
             is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
             if is_boundary:
@@ -452,71 +529,82 @@ def train():
                 scheduler.step()
                 metrics.opt_step += 1
 
-                all_p = torch.cat(accum_preds)
-                all_l = torch.cat(accum_labels)
-                metrics.append_regression(all_p, all_l)
-                reg = metrics.get_regression_metrics()
+                if _is_main():
+                    all_p = torch.cat(accum_preds)
+                    all_l = torch.cat(accum_labels)
+                    metrics.append_regression(all_p, all_l)
+                    reg = metrics.get_regression_metrics()
 
-                avg_loss = accum_loss / accum_count
-                log = {
-                    "loss": avg_loss,
-                    "lr": optimizer.param_groups[-1]["lr"],
-                    **reg,
-                }
-                metrics.append("train", log)
+                    avg_loss = accum_loss / accum_count
+                    log = {
+                        "loss": avg_loss,
+                        "lr": optimizer.param_groups[-1]["lr"],
+                        **reg,
+                    }
+                    metrics.append("train", log)
 
-                pbar.set_postfix_str(
-                    f"loss={avg_loss:.4f} mae={reg['mae']:.4f} r={reg['pearson_r']:.3f}",
-                    refresh=True,
-                )
+                    pbar.set_postfix_str(
+                        f"loss={avg_loss:.4f} mae={reg['mae']:.4f} r={reg['pearson_r']:.3f}",
+                        refresh=True,
+                    )
 
-                # ETA
-                elapsed = time.time() - epoch_start
-                done = batch_idx + 1
-                remaining = elapsed / done * (total_batches - done)
-                remaining += elapsed / done * total_batches * (cfg.epochs - epoch)
-                metrics.eta_str = f"batch {done}/{total_batches} | {_format_time(elapsed)} elapsed, ETA {_format_time(remaining)}"
+                    # ETA
+                    elapsed = time.time() - epoch_start
+                    done = batch_idx + 1
+                    remaining = elapsed / done * (total_batches - done)
+                    remaining += elapsed / done * total_batches * (cfg.epochs - epoch)
+                    metrics.eta_str = f"batch {done}/{total_batches} | {_format_time(elapsed)} elapsed, ETA {_format_time(remaining)}"
 
                 accum_loss = 0.0
                 accum_preds, accum_labels = [], []
                 accum_count = 0
 
-                if metrics.opt_step % cfg.plot_interval == 0:
+                if _is_main() and metrics.opt_step % cfg.plot_interval == 0:
                     metrics.plot()
                     metrics.plot_scatter()
 
                 if metrics.opt_step % cfg.val_interval == 0:
-                    val_metrics, vp, vg = validate(model, val_loader, cfg)
-                    metrics.append("val", val_metrics)
-                    metrics.plot()
-                    metrics.plot_scatter(val_preds=vp, val_gts=vg)
-                    if val_metrics["r2"] > metrics.best_val_r2:
-                        metrics.best_val_r2 = val_metrics["r2"]
-                        save_checkpoint(model, optimizer, scheduler, metrics,
-                                        os.path.join(cfg.save_dir, "best.pt"))
-                        print(f"  New best val R²={val_metrics['r2']:.4f}")
+                    if _is_main():
+                        val_metrics, vp, vg = validate(model, val_loader, cfg)
+                        metrics.append("val", val_metrics)
+                        metrics.plot()
+                        metrics.plot_scatter(val_preds=vp, val_gts=vg)
+                        if val_metrics["r2"] > metrics.best_val_r2:
+                            metrics.best_val_r2 = val_metrics["r2"]
+                            save_checkpoint(model, optimizer, scheduler, metrics,
+                                            os.path.join(cfg.save_dir, "best.pt"))
+                            print(f"  New best val R²={val_metrics['r2']:.4f}")
+                    # Sync all ranks so non-rank-0 don't race ahead during val
+                    if _is_distributed():
+                        dist.barrier()
                     model.train()
 
-        # End-of-epoch validation
-        val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
-        metrics.append("val", val_metrics)
-        print(f"Epoch {epoch}/{cfg.epochs}  val_loss={val_metrics['loss']:.5f}  "
-              f"mae={val_metrics['mae']:.4f}  r={val_metrics['pearson_r']:.4f}  "
-              f"r2={val_metrics['r2']:.4f}")
+        # End-of-epoch validation (rank 0 only; others wait at barrier)
+        if _is_main():
+            val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
+            metrics.append("val", val_metrics)
+            print(f"Epoch {epoch}/{cfg.epochs}  val_loss={val_metrics['loss']:.5f}  "
+                  f"mae={val_metrics['mae']:.4f}  r={val_metrics['pearson_r']:.4f}  "
+                  f"r2={val_metrics['r2']:.4f}")
 
-        metrics.plot()
-        metrics.plot_scatter(val_preds=val_preds, val_gts=val_gts)
-        metrics.save(os.path.join(cfg.save_dir, "metrics.json"))
-        save_checkpoint(model, optimizer, scheduler, metrics,
-                        os.path.join(cfg.save_dir, "latest.pt"))
-        if val_metrics["r2"] > metrics.best_val_r2:
-            metrics.best_val_r2 = val_metrics["r2"]
+            metrics.plot()
+            metrics.plot_scatter(val_preds=val_preds, val_gts=val_gts)
+            metrics.save(os.path.join(cfg.save_dir, "metrics.json"))
             save_checkpoint(model, optimizer, scheduler, metrics,
-                            os.path.join(cfg.save_dir, "best.pt"))
-            print(f"  New best val R²={val_metrics['r2']:.4f}")
+                            os.path.join(cfg.save_dir, "latest.pt"))
+            if val_metrics["r2"] > metrics.best_val_r2:
+                metrics.best_val_r2 = val_metrics["r2"]
+                save_checkpoint(model, optimizer, scheduler, metrics,
+                                os.path.join(cfg.save_dir, "best.pt"))
+                print(f"  New best val R²={val_metrics['r2']:.4f}")
+
+        if _is_distributed():
+            dist.barrier()
         model.train()
 
-    print("Training complete.")
+    if _is_main():
+        print("Training complete.")
+    _cleanup_distributed()
 
 
 if __name__ == "__main__":
