@@ -81,8 +81,8 @@ class Config:
 
     # Logging / checkpoints
     plot_interval: int = 10
-    val_interval: int = 500
-    val_max_volumes: int = 100
+    val_interval: int = 2000
+    val_max_volumes: int = 50
     save_dir: str = "checkpoints_efficientnet"
     scatter_dir: str = "scatter_plots_efficientnet"
 
@@ -387,10 +387,7 @@ def train():
             accum_labels.append(batch["label"])
             accum_count += 1
 
-            if _is_main():
-                pbar.set_postfix_str(
-                    f"micro={accum_count}/{accum} loss={step_metrics['loss']:.4f}", refresh=False
-                )
+            # (micro-batch postfix removed to prevent tqdm flickering)
 
             is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
             if is_boundary:
