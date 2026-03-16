@@ -67,7 +67,7 @@ class Config:
 
     # Training
     epochs: int = 20
-    batch_size: int = 1          # Per-GPU; effective = batch_size * accum * world
+    batch_size: int = 16         # Per-GPU; effective = batch_size * accum * world
     grad_accum_steps: int = 4    # Target effective batch = 4 (paper)
 
     # Optimizer (Adam, paper uses "variable learning rate schedule")
@@ -319,10 +319,11 @@ def train():
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=(train_sampler is None),
         sampler=train_sampler, num_workers=cfg.num_workers, pin_memory=True,
+        prefetch_factor=4, persistent_workers=True,
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
-        pin_memory=True,
+        pin_memory=True, prefetch_factor=4, persistent_workers=True,
     )
 
     # Model — from scratch, no pretraining
@@ -383,10 +384,17 @@ def train():
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs}",
                     leave=True, disable=not _is_main())
+        data_time_total, compute_time_total = 0.0, 0.0
+        _t_data = time.time()
         for batch_idx, batch in enumerate(pbar):
+            data_time_total += time.time() - _t_data
+            _t_compute = time.time()
             step_metrics, preds = forward_step(
                 batch["frames"], batch["label"], model, accum,
             )
+            torch.cuda.synchronize()
+            compute_time_total += time.time() - _t_compute
+            _t_data = time.time()
             accum_loss += step_metrics["loss"]
             accum_preds.append(preds)
             accum_labels.append(batch["label"])
@@ -418,7 +426,8 @@ def train():
                     metrics.append("train", log)
 
                     pbar.set_postfix_str(
-                        f"loss={avg_loss:.4f} mae={reg['mae']:.4f} r={reg['pearson_r']:.3f}",
+                        f"loss={avg_loss:.4f} mae={reg['mae']:.4f} r={reg['pearson_r']:.3f}"
+                        f" | data={data_time_total:.1f}s gpu={compute_time_total:.1f}s",
                         refresh=True,
                     )
 
