@@ -312,7 +312,7 @@ def train():
         num_frames=cfg.num_frames,
     )
     train_ds = HVFDataset(split_label="train", **ds_kwargs)
-    val_ds = HVFDataset(split_label="val", **ds_kwargs)
+    val_ds = HVFDataset(split_label="val", cache_in_memory=True, **ds_kwargs)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world, rank=rank,
                                        shuffle=True) if world > 1 else None
@@ -447,8 +447,8 @@ def train():
                     metrics.plot_scatter()
 
                 if metrics.opt_step % cfg.val_interval == 0:
-                    val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                     if _is_main():
+                        val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                         metrics.append("val", val_metrics)
                         metrics.append_val_regression(vp, vg)
                         metrics.plot()
@@ -462,9 +462,9 @@ def train():
                         dist.barrier()
                     model.train()
 
-        # End-of-epoch full validation
-        val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
+        # End-of-epoch full validation (rank 0 only — no point duplicating IO)
         if _is_main():
+            val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
             metrics.append("val", val_metrics)
             print(f"Epoch {epoch}/{cfg.epochs}  val_loss={val_metrics['loss']:.5f}  "
                   f"mae={val_metrics['mae']:.4f}  r={val_metrics['pearson_r']:.4f}  "

@@ -13,7 +13,7 @@ from utils import load_config
 
 
 class HVFDataset(torch.utils.data.Dataset):
-    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None, num_frames=None):
+    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None, num_frames=None, cache_in_memory=False):
         super().__init__()
 
         self.cfg = load_config("config.json")
@@ -64,16 +64,14 @@ class HVFDataset(torch.utils.data.Dataset):
         self.mx = a - margin
         self.mn = b + margin
         self.data = data_df[data_df["split"] == split_label]
+        self._cache = {} if cache_in_memory else None
 
     def rescale_label(self, label):
         normalized = (label - self.mn) / (self.mx - self.mn)
         return np.clip(normalized, 1e-6, 1 - 1e-6)
 
-    @beartype
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        mrn = row["mrn"]
-        label = torch.tensor(self.rescale_label(row['hvf_mtd']))
+    def _load_and_preprocess(self, row):
+        """Load DICOM, crop, resize, resample — the expensive part."""
         oct_path = os.path.join(
             self.dcm_path, row["img_fn"].lstrip("/")
         )
@@ -90,16 +88,14 @@ class HVFDataset(torch.utils.data.Dataset):
         # Resize if needed
         if self.target_size is not None:
             target_H, target_W = self.target_size
-            # im shape: (frames, H, W) -> need (frames, 1, H, W) for interpolate
             im = F.interpolate(
-                im.unsqueeze(1), 
-                size=(target_H, target_W), 
-                mode='bilinear', 
+                im.unsqueeze(1),
+                size=(target_H, target_W),
+                mode='bilinear',
                 align_corners=False
             ).squeeze(1)
         # Resample temporal dimension if num_frames is set
         if self.num_frames is not None and im.shape[0] != self.num_frames:
-            # im: (F, H, W) -> (1, 1, F, H, W) for 3D interpolate -> (F', H, W)
             im = F.interpolate(
                 im.unsqueeze(0).unsqueeze(0),
                 size=(self.num_frames, im.shape[1], im.shape[2]),
@@ -112,9 +108,28 @@ class HVFDataset(torch.utils.data.Dataset):
         # Normalize to 0-1
         if self.normalize:
             im = (im - im.min()) / (im.max() - im.min() + 1e-8)
-            local = {"frames": im, "label": label, "mrn": mrn}
-            return local
 
+        return im
+
+    @beartype
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        mrn = row["mrn"]
+        label = torch.tensor(self.rescale_label(row['hvf_mtd']))
+
+        # Use cached tensor if available, otherwise load from DICOM
+        if self._cache is not None:
+            cache_key = row["img_fn"]
+            if cache_key in self._cache:
+                im = self._cache[cache_key]
+            else:
+                im = self._load_and_preprocess(row)
+                self._cache[cache_key] = im
+        else:
+            im = self._load_and_preprocess(row)
+
+        if self.normalize:
+            return {"frames": im, "label": label, "mrn": mrn}
         return im, label
 
     def __len__(self):
