@@ -13,7 +13,7 @@ from utils import load_config
 
 
 class HVFDataset(torch.utils.data.Dataset):
-    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None):
+    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None, num_frames=None):
         super().__init__()
 
         self.cfg = load_config("config.json")
@@ -21,6 +21,7 @@ class HVFDataset(torch.utils.data.Dataset):
         self.target_size = target_size
         self.normalize=normalize
         self.center_crop_frac = center_crop_frac  # e.g. 0.5 keeps center 50% of W
+        self.num_frames = num_frames  # resample temporal dim if set (e.g. 128)
 
         
         self.hvfmd_path = "macula_oct_partially_deduplicated.tsv" if anatomy == "macula" else "optic_nerve_oct_partially_deduplicated.tsv"
@@ -96,8 +97,18 @@ class HVFDataset(torch.utils.data.Dataset):
                 mode='bilinear', 
                 align_corners=False
             ).squeeze(1)
+        # Resample temporal dimension if num_frames is set
+        if self.num_frames is not None and im.shape[0] != self.num_frames:
+            # im: (F, H, W) -> (1, 1, F, H, W) for 3D interpolate -> (F', H, W)
+            im = F.interpolate(
+                im.unsqueeze(0).unsqueeze(0),
+                size=(self.num_frames, im.shape[1], im.shape[2]),
+                mode='trilinear',
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+
         im : Float[Tensor, "C F H W"] = einops.rearrange(im, "F H W -> 1 F H W")
-        
+
         # Normalize to 0-1
         if self.normalize:
             im = (im - im.min()) / (im.max() - im.min() + 1e-8)
