@@ -71,7 +71,7 @@ class Config:
     grad_accum_steps: int = 4    # Target effective batch = 4 (paper)
 
     # Optimizer (Adam, paper uses "variable learning rate schedule")
-    lr: float = 1e-3
+    lr: float = 4e-3             # sqrt-scaled for batch_size=16 (was 1e-3 at bs=1)
     weight_decay: float = 1e-4
     min_lr: float = 1e-6
     warmup_epochs: int = 2
