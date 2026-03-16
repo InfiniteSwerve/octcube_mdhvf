@@ -288,6 +288,8 @@ def save_checkpoint(model, optimizer, scheduler, metrics, path):
 
 def train():
     _setup_distributed()
+    # Auto-tune cuDNN kernels for fixed input sizes (128x224x224)
+    torch.backends.cudnn.benchmark = True
     rank = _rank()
     world = _world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -332,6 +334,9 @@ def train():
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
+
+    # torch.compile for fused kernels (Conv3d+BN+SiLU, etc.)
+    model = torch.compile(model)
 
     # Optimizer — Adam (paper), no LLRD needed (training from scratch)
     optimizer = torch.optim.Adam(
