@@ -312,7 +312,7 @@ def train():
         num_frames=cfg.num_frames,
     )
     train_ds = HVFDataset(split_label="train", **ds_kwargs)
-    val_ds = HVFDataset(split_label="val", cache_in_memory=True, **ds_kwargs)
+    val_ds = HVFDataset(split_label="val", **ds_kwargs)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world, rank=rank,
                                        shuffle=True) if world > 1 else None

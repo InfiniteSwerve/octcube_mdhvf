@@ -13,7 +13,7 @@ from utils import load_config
 
 
 class HVFDataset(torch.utils.data.Dataset):
-    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None, num_frames=None, cache_in_memory=False):
+    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None, num_frames=None):
         super().__init__()
 
         self.cfg = load_config("config.json")
@@ -64,7 +64,6 @@ class HVFDataset(torch.utils.data.Dataset):
         self.mx = a - margin
         self.mn = b + margin
         self.data = data_df[data_df["split"] == split_label]
-        self._cache = {} if cache_in_memory else None
 
     def rescale_label(self, label):
         normalized = (label - self.mn) / (self.mx - self.mn)
@@ -116,17 +115,7 @@ class HVFDataset(torch.utils.data.Dataset):
         row = self.data.iloc[idx]
         mrn = row["mrn"]
         label = torch.tensor(self.rescale_label(row['hvf_mtd']))
-
-        # Use cached tensor if available, otherwise load from DICOM
-        if self._cache is not None:
-            cache_key = row["img_fn"]
-            if cache_key in self._cache:
-                im = self._cache[cache_key]
-            else:
-                im = self._load_and_preprocess(row)
-                self._cache[cache_key] = im
-        else:
-            im = self._load_and_preprocess(row)
+        im = self._load_and_preprocess(row)
 
         if self.normalize:
             return {"frames": im, "label": label, "mrn": mrn}
