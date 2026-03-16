@@ -233,18 +233,41 @@ def forward_step(images, labels, model, accum):
     return {"loss": loss.item(), "pred_std": pred.detach().std().item()}, pred.detach().cpu()
 
 
+def _gather_tensors(t: torch.Tensor) -> torch.Tensor:
+    """All-gather 1-D tensors of varying length across ranks."""
+    if not _is_distributed():
+        return t
+    device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
+    local_n = torch.tensor([t.shape[0]], device=device)
+    world = _world_size()
+    all_n = [torch.zeros(1, device=device, dtype=torch.long) for _ in range(world)]
+    dist.all_gather(all_n, local_n)
+    max_n = max(x.item() for x in all_n)
+    # Pad to max_n
+    padded = torch.zeros(max_n, device=device)
+    padded[:t.shape[0]] = t.to(device)
+    gathered = [torch.zeros(max_n, device=device) for _ in range(world)]
+    dist.all_gather(gathered, padded)
+    # Trim padding from each rank
+    return torch.cat([g[:n.int().item()] for g, n in zip(gathered, all_n)]).cpu()
+
+
 def validate(model, loader, cfg: Config, max_volumes: int | None = None):
     eval_model = model.module if isinstance(model, DDP) else model
     eval_model.eval()
     device = next(eval_model.parameters()).device
     all_preds, all_labels = [], []
     total_loss, n = 0.0, 0
-    total_batches = len(loader) if max_volumes is None else min(len(loader), max_volumes)
+    # max_volumes is per-rank when distributed
+    max_per_rank = None
+    if max_volumes is not None:
+        max_per_rank = max(1, max_volumes // _world_size())
+    total_batches = len(loader) if max_per_rank is None else min(len(loader), max_per_rank)
     pbar = tqdm(loader, total=total_batches, desc="Validating",
                 disable=not _is_main(), leave=False)
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         for batch in pbar:
-            if max_volumes is not None and n >= max_volumes:
+            if max_per_rank is not None and n >= max_per_rank:
                 break
             imgs = batch["frames"].to(device)
             labels = batch["label"].to(device)
@@ -255,10 +278,15 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
             n += imgs.shape[0]
             if _is_main():
                 pbar.set_postfix_str(f"loss={total_loss/n:.4f} n={n}", refresh=False)
-    preds = torch.cat(all_preds)
-    gts = torch.cat(all_labels)
+    local_preds = torch.cat(all_preds).flatten()
+    local_gts = torch.cat(all_labels).flatten()
+
+    # Gather predictions from all ranks
+    preds = _gather_tensors(local_preds)
+    gts = _gather_tensors(local_gts)
+
     mae = (preds - gts).abs().mean().item()
-    r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item()
+    r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item() if preds.std() > 1e-8 else 0.0
     ss_res = ((preds - gts) ** 2).sum().item()
     ss_tot = ((gts - gts.mean()) ** 2).sum().item()
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -321,8 +349,11 @@ def train():
         sampler=train_sampler, num_workers=cfg.num_workers, pin_memory=True,
         prefetch_factor=4, persistent_workers=True,
     )
+    val_sampler = DistributedSampler(val_ds, num_replicas=world, rank=rank,
+                                      shuffle=False) if world > 1 else None
     val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        sampler=val_sampler, num_workers=cfg.num_workers,
         pin_memory=True, prefetch_factor=4, persistent_workers=True,
     )
 
@@ -447,8 +478,8 @@ def train():
                     metrics.plot_scatter()
 
                 if metrics.opt_step % cfg.val_interval == 0:
+                    val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                     if _is_main():
-                        val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                         metrics.append("val", val_metrics)
                         metrics.append_val_regression(vp, vg)
                         metrics.plot()
@@ -462,9 +493,9 @@ def train():
                         dist.barrier()
                     model.train()
 
-        # End-of-epoch full validation (rank 0 only — no point duplicating IO)
+        # End-of-epoch full validation — distributed across all GPUs
+        val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
         if _is_main():
-            val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
             metrics.append("val", val_metrics)
             print(f"Epoch {epoch}/{cfg.epochs}  val_loss={val_metrics['loss']:.5f}  "
                   f"mae={val_metrics['mae']:.4f}  r={val_metrics['pearson_r']:.4f}  "
