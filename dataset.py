@@ -153,8 +153,21 @@ class HVFDataset(torch.utils.data.Dataset):
             "range": multi_grouped.apply(lambda x: x.max() - x.min()),
         })
 
-        # Overall stats
+        # Overall label distribution stats (all samples, not just repeated)
+        all_labels = df["label_norm"].values
+        label_stats = {
+            "n_total_samples": len(all_labels),
+            "label_std": float(np.std(all_labels)),
+            "label_mean": float(np.mean(all_labels)),
+            "label_median": float(np.median(all_labels)),
+            "label_min": float(np.min(all_labels)),
+            "label_max": float(np.max(all_labels)),
+            "label_iqr": float(np.percentile(all_labels, 75) - np.percentile(all_labels, 25)),
+        }
+
+        # Overall test-retest stats (patients with ≥2 samples)
         overall = {
+            **label_stats,
             "n_patients": len(per_patient),
             "n_samples": int(per_patient["count"].sum()),
             "mean_std": float(per_patient["std"].mean()),
@@ -162,6 +175,16 @@ class HVFDataset(torch.utils.data.Dataset):
             "mean_range": float(per_patient["range"].mean()),
             "median_range": float(per_patient["range"].median()),
         }
+
+        print(f"\n{'='*60}")
+        print(f"Label Distribution (normalized 0-1 scale)")
+        print(f"{'='*60}")
+        print(f"Total samples: {label_stats['n_total_samples']}")
+        print(f"Label std:     {label_stats['label_std']:.4f}")
+        print(f"Label mean:    {label_stats['label_mean']:.4f}  "
+              f"median: {label_stats['label_median']:.4f}")
+        print(f"Label range:   [{label_stats['label_min']:.4f}, {label_stats['label_max']:.4f}]  "
+              f"IQR: {label_stats['label_iqr']:.4f}")
 
         print(f"\n{'='*60}")
         print(f"Test-Retest Variability (normalized 0-1 scale)")
