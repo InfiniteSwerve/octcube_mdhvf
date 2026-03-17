@@ -57,16 +57,17 @@ class HVFDataset(torch.utils.data.Dataset):
             splits.to_csv("training_splits.csv", index=False)
 
         data_df = pd.merge(data_df, splits, left_on="hvf_mrn", right_on="mrn")
-        check = np.array(data_df['hvf_mtd'])
-        p1, p99 = np.percentile(check, [1, 99])
-        margin = (p99 - p1) * 0.05
-        self.label_min = p1 - margin
-        self.label_max = p99 + margin
+        all_mtd = np.array(data_df['hvf_mtd'])
+        self.label_mean = float(np.mean(all_mtd))
+        self.label_std = float(np.std(all_mtd))
         self.data = data_df[data_df["split"] == split_label]
 
     def rescale_label(self, label):
-        normalized = (label - self.label_min) / (self.label_max - self.label_min)
-        return np.clip(normalized, 1e-6, 1 - 1e-6)
+        return (label - self.label_mean) / self.label_std
+
+    def unscale_label(self, z):
+        """Convert z-score back to original MTD scale."""
+        return z * self.label_std + self.label_mean
 
     def _load_and_preprocess(self, row):
         """Load DICOM, crop, resize, resample — the expensive part."""
@@ -176,7 +177,7 @@ class HVFDataset(torch.utils.data.Dataset):
         }
 
         print(f"\n{'='*60}")
-        print(f"Label Distribution (normalized 0-1 scale)")
+        print(f"Label Distribution (z-score scale)")
         print(f"{'='*60}")
         print(f"Total samples: {label_stats['n_total_samples']}")
         print(f"Label std:     {label_stats['label_std']:.4f}")
@@ -186,7 +187,7 @@ class HVFDataset(torch.utils.data.Dataset):
               f"IQR: {label_stats['label_iqr']:.4f}")
 
         print(f"\n{'='*60}")
-        print(f"Test-Retest Variability (normalized 0-1 scale)")
+        print(f"Test-Retest Variability (z-score scale)")
         print(f"{'='*60}")
         print(f"Patients with ≥2 samples: {overall['n_patients']} "
               f"({overall['n_samples']} total samples)")
@@ -195,8 +196,9 @@ class HVFDataset(torch.utils.data.Dataset):
         print(f"Within-patient label range:  mean={overall['mean_range']:.4f}  "
               f"median={overall['median_range']:.4f}")
 
-        # Binned by patient mean label
-        edges = np.linspace(0, 1, n_bins + 1)
+        # Binned by patient mean label (data-driven edges)
+        all_means = per_patient["mean"].values
+        edges = np.linspace(all_means.min(), all_means.max(), n_bins + 1)
         bins_out = []
         print(f"\n{'Bin':>12s}  {'n_pts':>5s}  {'mean_std':>8s}  {'med_std':>8s}  "
               f"{'mean_rng':>8s}  {'med_rng':>8s}")
