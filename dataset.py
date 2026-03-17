@@ -124,6 +124,96 @@ class HVFDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.data)
 
+    def test_retest_variability(self, n_bins=10):
+        """Calculate test-retest variability for patients with multiple samples.
+
+        Groups by MRN, computes within-patient std of normalized labels,
+        then reports overall and per-bin statistics.
+
+        Returns a dict with:
+          - overall: {n_patients, n_samples, mean_std, median_std, mean_range, median_range}
+          - bins: list of per-bin dicts with {bin_center, bin_lo, bin_hi, n_patients, mean_std, ...}
+          - raw: DataFrame with per-patient stats
+        """
+        df = self.data.copy()
+        df["label_norm"] = df["hvf_mtd"].apply(self.rescale_label)
+
+        grouped = df.groupby("mrn")["label_norm"]
+        # Only patients with ≥2 samples
+        multi = grouped.filter(lambda x: len(x) >= 2)
+        if len(multi) == 0:
+            print("No patients with multiple samples found.")
+            return None
+
+        multi_grouped = df.loc[multi.index].groupby("mrn")["label_norm"]
+        per_patient = pd.DataFrame({
+            "count": multi_grouped.count(),
+            "mean": multi_grouped.mean(),
+            "std": multi_grouped.std(),
+            "range": multi_grouped.apply(lambda x: x.max() - x.min()),
+        })
+
+        # Overall stats
+        overall = {
+            "n_patients": len(per_patient),
+            "n_samples": int(per_patient["count"].sum()),
+            "mean_std": float(per_patient["std"].mean()),
+            "median_std": float(per_patient["std"].median()),
+            "mean_range": float(per_patient["range"].mean()),
+            "median_range": float(per_patient["range"].median()),
+        }
+
+        print(f"\n{'='*60}")
+        print(f"Test-Retest Variability (normalized 0-1 scale)")
+        print(f"{'='*60}")
+        print(f"Patients with ≥2 samples: {overall['n_patients']} "
+              f"({overall['n_samples']} total samples)")
+        print(f"Within-patient label std:    mean={overall['mean_std']:.4f}  "
+              f"median={overall['median_std']:.4f}")
+        print(f"Within-patient label range:  mean={overall['mean_range']:.4f}  "
+              f"median={overall['median_range']:.4f}")
+
+        # Binned by patient mean label
+        edges = np.linspace(0, 1, n_bins + 1)
+        bins_out = []
+        print(f"\n{'Bin':>12s}  {'n_pts':>5s}  {'mean_std':>8s}  {'med_std':>8s}  "
+              f"{'mean_rng':>8s}  {'med_rng':>8s}")
+        print("-" * 60)
+        for i in range(n_bins):
+            lo, hi = edges[i], edges[i + 1]
+            if i == n_bins - 1:
+                mask = (per_patient["mean"] >= lo) & (per_patient["mean"] <= hi)
+            else:
+                mask = (per_patient["mean"] >= lo) & (per_patient["mean"] < hi)
+            subset = per_patient[mask]
+            center = (lo + hi) / 2
+            bin_info = {
+                "bin_center": float(center),
+                "bin_lo": float(lo),
+                "bin_hi": float(hi),
+                "n_patients": len(subset),
+            }
+            if len(subset) > 0:
+                bin_info.update({
+                    "mean_std": float(subset["std"].mean()),
+                    "median_std": float(subset["std"].median()),
+                    "mean_range": float(subset["range"].mean()),
+                    "median_range": float(subset["range"].median()),
+                })
+            else:
+                bin_info.update({
+                    "mean_std": 0.0, "median_std": 0.0,
+                    "mean_range": 0.0, "median_range": 0.0,
+                })
+            bins_out.append(bin_info)
+            print(f"  [{lo:.2f},{hi:.2f})  {bin_info['n_patients']:>5d}  "
+                  f"{bin_info['mean_std']:>8.4f}  {bin_info['median_std']:>8.4f}  "
+                  f"{bin_info['mean_range']:>8.4f}  {bin_info['median_range']:>8.4f}")
+
+        print(f"{'='*60}\n")
+
+        return {"overall": overall, "bins": bins_out, "raw": per_patient}
+
 
 class FeatureDataset(torch.utils.data.Dataset):
     """Loads pre-extracted (N, 1024) features and (N,) labels from .npy files."""
