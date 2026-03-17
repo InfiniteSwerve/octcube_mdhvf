@@ -10,6 +10,7 @@ Control experiment against OCTCube, following Koyama et al. (Sci Rep 2025):
 Launch:  torchrun --nproc_per_node=4 finetune_efficientnet.py
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,6 +86,8 @@ class Config:
     val_max_volumes: int = 50
     save_dir: str = "checkpoints_efficientnet"
     scatter_dir: str = "scatter_plots_efficientnet"
+    plot_dir: str = "plots_efficientnet"
+    box_bins: int = 10
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────
@@ -105,7 +108,10 @@ def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):
 # ── Metrics (reused from finetune.py) ─────────────────────────────────
 
 class Metrics:
-    def __init__(self):
+    def __init__(self, plot_dir="plots_efficientnet", box_bins=10):
+        self.plot_dir = plot_dir
+        self.box_bins = box_bins
+        os.makedirs(plot_dir, exist_ok=True)
         self.data = {}
         for split in ["train", "val"]:
             self.data[split] = {"iterations": [], "metrics": defaultdict(list)}
@@ -119,6 +125,8 @@ class Metrics:
         self.best_val_r2 = -float("inf")
         self._full_val_preds = None
         self._full_val_gts = None
+        self._best_val_preds = None
+        self._best_val_gts = None
 
     def append(self, split, metrics_dict):
         self.data[split]["iterations"].append(self.opt_step)
@@ -156,7 +164,7 @@ class Metrics:
                     ax.legend(fontsize=7)
         fig.suptitle(f"EfficientNet3D | Epoch {self.epoch} | step {self.opt_step} | {self.eta_str}", fontsize=10)
         fig.tight_layout()
-        plt.savefig("efficientnet_metrics.png", dpi=120)
+        plt.savefig(os.path.join(self.plot_dir, "finetune_metrics_efficientnet.png"), dpi=120)
         plt.close()
 
     def append_val_regression(self, preds, gts):
@@ -169,6 +177,24 @@ class Metrics:
     def set_full_val(self, preds, gts):
         self._full_val_preds = preds
         self._full_val_gts = gts
+
+    def update_best_val(self, preds, gts):
+        """Store best validation preds/gts and save dedicated best-val plots."""
+        self._best_val_preds = preds
+        self._best_val_gts = gts
+        self._save_best_val_plots()
+
+    def _save_best_val_plots(self):
+        if self._best_val_preds is None:
+            return
+        gt = self._best_val_gts
+        pred = self._best_val_preds
+        fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+        title = f"Best Val (n={len(pred)}, epoch {self.epoch})"
+        self._scatter_panel(ax, gt, pred, title, box_bins=self.box_bins)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, "finetune_scatter_efficientnet_best.png"), dpi=150)
+        plt.close()
 
     def plot_scatter(self):
         panels = []
@@ -187,21 +213,47 @@ class Metrics:
         if len(panels) == 1:
             axes = [axes]
         for ax, (gt, pred, title) in zip(axes, panels):
-            self._scatter_panel(ax, gt, pred, title)
+            self._scatter_panel(ax, gt, pred, title, box_bins=self.box_bins)
         fig.tight_layout()
-        plt.savefig("efficientnet_scatter.png", dpi=120)
+        plt.savefig(os.path.join(self.plot_dir, "finetune_scatter_efficientnet.png"), dpi=120)
         plt.close()
 
     @staticmethod
-    def _scatter_panel(ax, gt, pred, title):
+    def _scatter_panel(ax, gt, pred, title, box_bins=10):
         mae = np.abs(pred - gt).mean()
         r = np.corrcoef(pred, gt)[0, 1] if np.std(pred) > 1e-8 else 0.0
         ss_res = ((pred - gt) ** 2).sum()
         ss_tot = ((gt - gt.mean()) ** 2).sum()
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        ax.scatter(gt, pred, s=4, alpha=0.4)
+        ax.scatter(gt, pred, s=4, alpha=0.4, zorder=2)
         lo, hi = min(gt.min(), pred.min()), max(gt.max(), pred.max())
-        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1)
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1, zorder=3)
+        # Box-and-whisker overlay
+        if len(gt) >= box_bins:
+            edges = np.linspace(gt.min(), gt.max(), box_bins + 1)
+            centers = []
+            groups = []
+            for i in range(box_bins):
+                mask = (gt >= edges[i]) & (gt < edges[i + 1])
+                if i == box_bins - 1:
+                    mask = (gt >= edges[i]) & (gt <= edges[i + 1])
+                if mask.sum() >= 2:
+                    centers.append((edges[i] + edges[i + 1]) / 2)
+                    groups.append(pred[mask])
+            if groups:
+                width = (edges[1] - edges[0]) * 0.6
+                bp = ax.boxplot(groups, positions=centers, widths=width,
+                                patch_artist=True, manage_ticks=False, zorder=4)
+                for box in bp["boxes"]:
+                    box.set(facecolor="C1", alpha=0.3)
+                for median in bp["medians"]:
+                    median.set(color="C3", linewidth=1.5)
+                for whisker in bp["whiskers"]:
+                    whisker.set(color="C1", alpha=0.5)
+                for cap in bp["caps"]:
+                    cap.set(color="C1", alpha=0.5)
+                for flier in bp["fliers"]:
+                    flier.set(marker=".", markersize=2, alpha=0.3)
         ax.set_xlabel("GT")
         ax.set_ylabel("Pred")
         ax.set_title(f"{title}\nMAE={mae:.4f}  r={r:.4f}  R²={r2:.4f}")
@@ -299,18 +351,23 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
     }, preds.numpy(), gts.numpy()
 
 
-def save_checkpoint(model, optimizer, scheduler, metrics, path):
+def save_checkpoint(model, optimizer, scheduler, metrics, path,
+                    val_preds=None, val_gts=None):
     if not _is_main():
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     raw_model = model.module if isinstance(model, DDP) else model
-    torch.save({
+    ckpt = {
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "opt_step": metrics.opt_step,
         "epoch": metrics.epoch,
-    }, path)
+    }
+    if val_preds is not None:
+        ckpt["val_preds"] = val_preds
+        ckpt["val_gts"] = val_gts
+    torch.save(ckpt, path)
     print(f"Saved checkpoint to {path}")
 
 
@@ -331,6 +388,7 @@ def train():
     if _is_main():
         os.makedirs(cfg.save_dir, exist_ok=True)
         os.makedirs(cfg.scatter_dir, exist_ok=True)
+        os.makedirs(cfg.plot_dir, exist_ok=True)
 
     # Data — note: different img_size and num_frames from OCTCube
     ds_kwargs = dict(
@@ -385,7 +443,7 @@ def train():
     opt_steps_per_epoch = len(train_loader) // accum
     scheduler = build_scheduler(optimizer, cfg, opt_steps_per_epoch)
 
-    metrics = Metrics()
+    metrics = Metrics(plot_dir=cfg.plot_dir, box_bins=cfg.box_bins)
 
     if _is_main():
         eff_batch = cfg.batch_size * accum * world
@@ -486,8 +544,10 @@ def train():
                         metrics.plot_scatter()
                         if val_metrics["r2"] > metrics.best_val_r2:
                             metrics.best_val_r2 = val_metrics["r2"]
+                            metrics.update_best_val(vp, vg)
                             save_checkpoint(model, optimizer, scheduler, metrics,
-                                            os.path.join(cfg.save_dir, "best.pt"))
+                                            os.path.join(cfg.save_dir, "best.pt"),
+                                            val_preds=vp, val_gts=vg)
                             print(f"  New best val R²={val_metrics['r2']:.4f}")
                     if _is_distributed():
                         dist.barrier()
@@ -506,11 +566,14 @@ def train():
             metrics.plot_scatter()
             metrics.save(os.path.join(cfg.save_dir, "metrics.json"))
             save_checkpoint(model, optimizer, scheduler, metrics,
-                            os.path.join(cfg.save_dir, "latest.pt"))
+                            os.path.join(cfg.save_dir, "latest.pt"),
+                            val_preds=val_preds, val_gts=val_gts)
             if val_metrics["r2"] > metrics.best_val_r2:
                 metrics.best_val_r2 = val_metrics["r2"]
+                metrics.update_best_val(val_preds, val_gts)
                 save_checkpoint(model, optimizer, scheduler, metrics,
-                                os.path.join(cfg.save_dir, "best.pt"))
+                                os.path.join(cfg.save_dir, "best.pt"),
+                                val_preds=val_preds, val_gts=val_gts)
                 print(f"  New best val R²={val_metrics['r2']:.4f}")
 
         if _is_distributed():
@@ -522,5 +585,75 @@ def train():
     _cleanup_distributed()
 
 
+def validate_from_checkpoint(ckpt_path=None, run_inference=True, box_bins=10):
+    """Load a checkpoint and regenerate best-val scatter+box plots.
+
+    If the checkpoint already contains saved val_preds/val_gts, plots are
+    generated instantly without running inference.  Pass run_inference=True
+    to re-run validation on the dataset (slower but always up-to-date).
+    """
+    cfg = Config()
+    cfg.box_bins = box_bins
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if ckpt_path is None:
+        ckpt_path = os.path.join(cfg.save_dir, "best.pt")
+    print(f"Loading checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    metrics = Metrics(plot_dir=cfg.plot_dir, box_bins=cfg.box_bins)
+    metrics.epoch = ckpt.get("epoch", 0)
+    metrics.opt_step = ckpt.get("opt_step", 0)
+
+    val_preds = ckpt.get("val_preds")
+    val_gts = ckpt.get("val_gts")
+
+    if val_preds is not None and not run_inference:
+        print(f"Using cached val preds from checkpoint (n={len(val_preds)})")
+    else:
+        print("Running validation inference...")
+        model = EfficientNet3D(
+            in_channels=1, num_classes=1,
+            dropout_rate=cfg.dropout, first_stride=2,
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        ds_kwargs = dict(
+            target_size=(cfg.img_size, cfg.img_size),
+            normalize=True,
+            center_crop_frac=cfg.center_crop_frac,
+            num_frames=cfg.num_frames,
+        )
+        val_ds = HVFDataset(split_label="val", **ds_kwargs)
+        val_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers, pin_memory=True,
+        )
+        _, val_preds, val_gts = validate(model, val_loader, cfg)
+
+    # Generate plots
+    metrics.update_best_val(val_preds, val_gts)
+    metrics.set_full_val(val_preds, val_gts)
+    metrics.plot_scatter()
+    print(f"Plots saved to {cfg.plot_dir}/")
+
+
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--validate", action="store_true",
+                        help="Run validation from checkpoint and generate plots (no training)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint (default: checkpoints_efficientnet/best.pt)")
+    parser.add_argument("--run-inference", action="store_true",
+                        help="Force re-running inference instead of using cached preds")
+    parser.add_argument("--box-bins", type=int, default=10,
+                        help="Number of bins for box-and-whisker plot (default: 10)")
+    args = parser.parse_args()
+
+    if args.validate:
+        validate_from_checkpoint(
+            ckpt_path=args.checkpoint,
+            run_inference=args.run_inference,
+            box_bins=args.box_bins,
+        )
+    else:
+        train()
