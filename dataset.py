@@ -58,15 +58,14 @@ class HVFDataset(torch.utils.data.Dataset):
 
         data_df = pd.merge(data_df, splits, left_on="hvf_mrn", right_on="mrn")
         check = np.array(data_df['hvf_mtd'])
-        a,b = np.percentile(check, [1,99])
-        margin = (b - a) * 0.05
-        a,b = a - margin, b + margin
-        self.mx = a - margin
-        self.mn = b + margin
+        p1, p99 = np.percentile(check, [1, 99])
+        margin = (p99 - p1) * 0.05
+        self.label_min = p1 - margin
+        self.label_max = p99 + margin
         self.data = data_df[data_df["split"] == split_label]
 
     def rescale_label(self, label):
-        normalized = (label - self.mn) / (self.mx - self.mn)
+        normalized = (label - self.label_min) / (self.label_max - self.label_min)
         return np.clip(normalized, 1e-6, 1 - 1e-6)
 
     def _load_and_preprocess(self, row):
