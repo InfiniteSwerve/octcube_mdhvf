@@ -123,6 +123,7 @@ class Metrics:
         self.rolling_val_gts = deque(maxlen=2000)
         self.eta_str = ""
         self.best_val_r2 = -float("inf")
+        self.best_val_epoch = -1
         self._full_val_preds = None
         self._full_val_gts = None
         self._best_val_preds = None
@@ -182,6 +183,7 @@ class Metrics:
         """Store best validation preds/gts and save dedicated best-val plots."""
         self._best_val_preds = preds
         self._best_val_gts = gts
+        self.best_val_epoch = self.epoch
         self._save_best_val_plots()
 
     def _save_best_val_plots(self):
@@ -257,6 +259,35 @@ class Metrics:
         ax.set_xlabel("GT")
         ax.set_ylabel("Pred")
         ax.set_title(f"{title}\nMAE={mae:.4f}  r={r:.4f}  R²={r2:.4f}")
+
+    def save_epoch_scatter(self, val_preds, val_gts):
+        """Save scatter plot for this epoch using full validation data."""
+        fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+        title = f"Val epoch {self.epoch} (n={len(val_preds)})"
+        self._scatter_panel(ax, val_gts, val_preds, title, box_bins=self.box_bins)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, f"finetune_scatter_efficientnet_epoch{self.epoch}.png"), dpi=150)
+        plt.close()
+
+    def save_epoch_metrics(self, val_metrics, path_dir):
+        """Save metrics JSON for this epoch."""
+        import json
+        path = os.path.join(path_dir, f"metrics_epoch{self.epoch}.json")
+        with open(path, "w") as f:
+            json.dump({
+                "opt_step": self.opt_step,
+                "epoch": self.epoch,
+                "val_metrics": val_metrics,
+                "data": {s: {"iterations": d["iterations"], "metrics": dict(d["metrics"])}
+                         for s, d in self.data.items()},
+            }, f)
+
+    def refresh_best_val_with_full_data(self, val_preds, val_gts):
+        """Re-save best val plots with full validation data if best was this epoch."""
+        if self.best_val_epoch == self.epoch:
+            self._best_val_preds = val_preds
+            self._best_val_gts = val_gts
+            self._save_best_val_plots()
 
     def save(self, path):
         import json
@@ -565,6 +596,9 @@ def train():
             metrics.plot()
             metrics.plot_scatter()
             metrics.save(os.path.join(cfg.save_dir, "metrics.json"))
+            # Per-epoch scatter and metrics
+            metrics.save_epoch_scatter(val_preds, val_gts)
+            metrics.save_epoch_metrics(val_metrics, cfg.save_dir)
             save_checkpoint(model, optimizer, scheduler, metrics,
                             os.path.join(cfg.save_dir, "latest.pt"),
                             val_preds=val_preds, val_gts=val_gts)
@@ -575,6 +609,8 @@ def train():
                                 os.path.join(cfg.save_dir, "best.pt"),
                                 val_preds=val_preds, val_gts=val_gts)
                 print(f"  New best val R²={val_metrics['r2']:.4f}")
+            # If best was found mid-epoch with partial data, re-save with full data
+            metrics.refresh_best_val_with_full_data(val_preds, val_gts)
 
         if _is_distributed():
             dist.barrier()

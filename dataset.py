@@ -13,7 +13,7 @@ from utils import load_config
 
 
 class HVFDataset(torch.utils.data.Dataset):
-    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None, num_frames=None):
+    def __init__(self, split_label="train", target_size=(512, 512), normalize=True, anatomy="macula", center_crop_frac=None, num_frames=None, norm_mode="zscore"):
         super().__init__()
 
         self.cfg = load_config("config.json")
@@ -22,6 +22,7 @@ class HVFDataset(torch.utils.data.Dataset):
         self.normalize=normalize
         self.center_crop_frac = center_crop_frac  # e.g. 0.5 keeps center 50% of W
         self.num_frames = num_frames  # resample temporal dim if set (e.g. 128)
+        self.norm_mode = norm_mode  # "zscore" or "minmax"
 
         
         self.hvfmd_path = "macula_oct_partially_deduplicated.tsv" if anatomy == "macula" else "optic_nerve_oct_partially_deduplicated.tsv"
@@ -58,15 +59,26 @@ class HVFDataset(torch.utils.data.Dataset):
 
         data_df = pd.merge(data_df, splits, left_on="hvf_mrn", right_on="mrn")
         all_mtd = np.array(data_df['hvf_mtd'])
+        # Z-score stats (always computed for unscale_label)
         self.label_mean = float(np.mean(all_mtd))
         self.label_std = float(np.std(all_mtd))
+        # Min-max stats
+        p1, p99 = np.percentile(all_mtd, [1, 99])
+        margin = (p99 - p1) * 0.05
+        self.label_min = p1 - margin
+        self.label_max = p99 + margin
         self.data = data_df[data_df["split"] == split_label]
 
     def rescale_label(self, label):
+        if self.norm_mode == "minmax":
+            normalized = (label - self.label_min) / (self.label_max - self.label_min)
+            return np.clip(normalized, 1e-6, 1 - 1e-6)
         return (label - self.label_mean) / self.label_std
 
     def unscale_label(self, z):
-        """Convert z-score back to original MTD scale."""
+        """Convert normalized label back to original MTD scale."""
+        if self.norm_mode == "minmax":
+            return z * (self.label_max - self.label_min) + self.label_min
         return z * self.label_std + self.label_mean
 
     def _load_and_preprocess(self, row):
