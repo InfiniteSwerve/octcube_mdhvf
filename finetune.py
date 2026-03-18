@@ -251,9 +251,14 @@ class OCTCubeFinetune(nn.Module):
 # ── Metrics ───────────────────────────────────────────────────────────
 
 class Metrics:
-    def __init__(self, plot_dir="plots_octcube", box_bins=10):
+    # Hodapp-Parrish-Anderson severity thresholds (MTD in dB)
+    HODAPP_THRESHOLDS = [0, -6, -12]
+    HODAPP_LABELS = ["Normal", "Early", "Moderate", "Advanced"]
+
+    def __init__(self, plot_dir="plots_octcube", box_bins=10, unscale_fn=None):
         self.plot_dir = plot_dir
         self.box_bins = box_bins
+        self.unscale_fn = unscale_fn  # callable: normalized -> original dB scale
         os.makedirs(plot_dir, exist_ok=True)
         self.data = {}
         for split in ["train", "val"]:
@@ -332,20 +337,35 @@ class Metrics:
         self._save_best_val_plots()
 
     def _save_best_val_plots(self):
-        """Save scatter+box plot specifically for the best validation epoch."""
+        """Save scatter+box, Hodapp scatter, and confusion matrix for best val epoch."""
         if self._best_val_preds is None:
             return
         gt = self._best_val_gts
         pred = self._best_val_preds
+        tag = f"Best Val (n={len(pred)}, epoch {self.epoch})"
+        # 1) Box scatter (original dB scale)
+        gt_db, pred_db = self._to_db(gt, pred)
         fig, ax = plt.subplots(1, 1, figsize=(7, 6))
-        title = f"Best Val (n={len(pred)}, epoch {self.epoch})"
-        self._scatter_panel(ax, gt, pred, title, box_bins=self.box_bins)
+        self._scatter_panel(ax, gt_db, pred_db, tag, box_bins=self.box_bins)
         fig.tight_layout()
         plt.savefig(os.path.join(self.plot_dir, "finetune_scatter_octcube_best.png"), dpi=150)
         plt.close()
+        # 2) Hodapp scatter
+        fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+        self._hodapp_scatter_panel(ax, gt_db, pred_db, tag)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, "finetune_hodapp_octcube_best.png"), dpi=150)
+        plt.close()
+        # 3) Confusion matrix
+        fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+        self._hodapp_confusion_panel(ax, gt_db, pred_db, tag)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, "finetune_confusion_octcube_best.png"), dpi=150)
+        plt.close()
 
     def plot_scatter(self):
-        """Plot up to 3 panels: rolling train, rolling val, full epoch val."""
+        """Plot up to 3 panels: rolling train, rolling val, full epoch val.
+        Produces three files: box scatter, Hodapp scatter, confusion matrix."""
         panels = []
         if len(self.rolling_preds) >= 20:
             panels.append((np.array(self.rolling_gts), np.array(self.rolling_preds),
@@ -358,13 +378,32 @@ class Metrics:
                            f"Val full epoch (n={len(self._full_val_preds)})"))
         if not panels:
             return
-        fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 5))
-        if len(panels) == 1:
+        # Convert all panels to dB scale
+        panels_db = [(self._to_db(gt, pred) + (title,)) for gt, pred, title in panels]
+        # 1) Box scatter
+        fig, axes = plt.subplots(1, len(panels_db), figsize=(5.5 * len(panels_db), 5))
+        if len(panels_db) == 1:
             axes = [axes]
-        for ax, (gt, pred, title) in zip(axes, panels):
+        for ax, (gt, pred, title) in zip(axes, panels_db):
             self._scatter_panel(ax, gt, pred, title, box_bins=self.box_bins)
         fig.tight_layout()
         plt.savefig(os.path.join(self.plot_dir, "finetune_scatter_octcube.png"), dpi=120)
+        plt.close()
+        # 2) Hodapp scatter
+        fig, axes = plt.subplots(1, len(panels_db), figsize=(5.5 * len(panels_db), 5))
+        if len(panels_db) == 1:
+            axes = [axes]
+        for ax, (gt, pred, title) in zip(axes, panels_db):
+            self._hodapp_scatter_panel(ax, gt, pred, title)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, "finetune_hodapp_octcube.png"), dpi=120)
+        plt.close()
+        # 3) Confusion matrix (use last panel with most data)
+        gt_db, pred_db, title = panels_db[-1]
+        fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+        self._hodapp_confusion_panel(ax, gt_db, pred_db, title)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, "finetune_confusion_octcube.png"), dpi=120)
         plt.close()
 
     @staticmethod
@@ -403,17 +442,103 @@ class Metrics:
                     cap.set(color="C1", alpha=0.5)
                 for flier in bp["fliers"]:
                     flier.set(marker=".", markersize=2, alpha=0.3)
-        ax.set_xlabel("GT")
-        ax.set_ylabel("Pred")
+        ax.set_xlabel("GT (dB)")
+        ax.set_ylabel("Pred (dB)")
         ax.set_title(f"{title}\nMAE={mae:.4f}  r={r:.4f}  R²={r2:.4f}")
 
+    def _to_db(self, gt, pred):
+        """Convert normalized arrays back to original dB scale."""
+        if self.unscale_fn is not None:
+            return self.unscale_fn(gt), self.unscale_fn(pred)
+        return gt, pred
+
+    @staticmethod
+    def _hodapp_class(vals):
+        """Classify MTD values (dB) into Hodapp severity: 0=Normal, 1=Early, 2=Moderate, 3=Advanced."""
+        cls = np.full(len(vals), 3, dtype=int)  # default Advanced
+        cls[vals > -12] = 2  # Moderate
+        cls[vals > -6] = 1   # Early
+        cls[vals > 0] = 0    # Normal
+        return cls
+
+    @staticmethod
+    def _hodapp_scatter_panel(ax, gt, pred, title):
+        """Scatter with Hodapp-Parrish-Anderson criterion lines (no box plot)."""
+        mae = np.abs(pred - gt).mean()
+        r = np.corrcoef(pred, gt)[0, 1] if np.std(pred) > 1e-8 else 0.0
+        ss_res = ((pred - gt) ** 2).sum()
+        ss_tot = ((gt - gt.mean()) ** 2).sum()
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        ax.scatter(gt, pred, s=4, alpha=0.4, zorder=2)
+        lo, hi = min(gt.min(), pred.min()), max(gt.max(), pred.max())
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1, zorder=3)
+        # Hodapp criterion lines
+        for thresh in [0, -6, -12]:
+            if lo <= thresh <= hi:
+                ax.axhline(thresh, color="gray", linestyle=":", linewidth=0.8, alpha=0.7, zorder=1)
+                ax.axvline(thresh, color="gray", linestyle=":", linewidth=0.8, alpha=0.7, zorder=1)
+        # Label the regions along GT axis
+        for thresh, lbl in [(0, "Normal"), (-6, "Early"), (-12, "Moderate")]:
+            if lo <= thresh <= hi:
+                ax.text(thresh, hi - (hi - lo) * 0.02, f"  {lbl}", fontsize=7,
+                        color="gray", ha="left", va="top", zorder=5)
+        if lo < -12:
+            ax.text(lo + (hi - lo) * 0.01, hi - (hi - lo) * 0.02, "Adv.",
+                    fontsize=7, color="gray", ha="left", va="top", zorder=5)
+        ax.set_xlabel("GT (dB)")
+        ax.set_ylabel("Pred (dB)")
+        ax.set_title(f"{title}\nMAE={mae:.4f}  r={r:.4f}  R²={r2:.4f}")
+
+    @classmethod
+    def _hodapp_confusion_panel(cls, ax, gt, pred, title):
+        """4x4 confusion matrix based on Hodapp severity classification."""
+        gt_cls = cls._hodapp_class(gt)
+        pred_cls = cls._hodapp_class(pred)
+        n_classes = len(cls.HODAPP_LABELS)
+        cm = np.zeros((n_classes, n_classes), dtype=int)
+        for g, p in zip(gt_cls, pred_cls):
+            cm[g, p] += 1
+        # Normalize rows for color intensity (recall per class)
+        row_sums = cm.sum(axis=1, keepdims=True)
+        cm_norm = np.where(row_sums > 0, cm / row_sums, 0)
+        ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1, aspect="equal")
+        # Annotate cells with count and percentage
+        for i in range(n_classes):
+            for j in range(n_classes):
+                pct = cm_norm[i, j] * 100
+                color = "white" if cm_norm[i, j] > 0.5 else "black"
+                ax.text(j, i, f"{cm[i, j]}\n{pct:.0f}%", ha="center", va="center",
+                        fontsize=9, color=color)
+        ax.set_xticks(range(n_classes))
+        ax.set_yticks(range(n_classes))
+        ax.set_xticklabels(cls.HODAPP_LABELS, fontsize=8)
+        ax.set_yticklabels(cls.HODAPP_LABELS, fontsize=8)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        accuracy = (gt_cls == pred_cls).mean()
+        ax.set_title(f"{title}\nHodapp Confusion (acc={accuracy:.1%})")
+
     def save_epoch_scatter(self, val_preds, val_gts):
-        """Save scatter plot for this epoch using full validation data."""
+        """Save scatter, Hodapp scatter, and confusion matrix for this epoch."""
+        gt_db, pred_db = self._to_db(val_gts, val_preds)
+        tag = f"Val epoch {self.epoch} (n={len(val_preds)})"
+        # 1) Box scatter
         fig, ax = plt.subplots(1, 1, figsize=(7, 6))
-        title = f"Val epoch {self.epoch} (n={len(val_preds)})"
-        self._scatter_panel(ax, val_gts, val_preds, title, box_bins=self.box_bins)
+        self._scatter_panel(ax, gt_db, pred_db, tag, box_bins=self.box_bins)
         fig.tight_layout()
         plt.savefig(os.path.join(self.plot_dir, f"finetune_scatter_octcube_epoch{self.epoch}.png"), dpi=150)
+        plt.close()
+        # 2) Hodapp scatter
+        fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+        self._hodapp_scatter_panel(ax, gt_db, pred_db, tag)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, f"finetune_hodapp_octcube_epoch{self.epoch}.png"), dpi=150)
+        plt.close()
+        # 3) Confusion matrix
+        fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+        self._hodapp_confusion_panel(ax, gt_db, pred_db, tag)
+        fig.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, f"finetune_confusion_octcube_epoch{self.epoch}.png"), dpi=150)
         plt.close()
 
     def save_epoch_metrics(self, val_metrics, path_dir):
@@ -588,7 +713,8 @@ def train():
     opt_steps_per_epoch = len(train_loader) // accum
     scheduler = build_scheduler(optimizer, cfg, opt_steps_per_epoch)
 
-    metrics = Metrics(plot_dir=cfg.plot_dir, box_bins=cfg.box_bins)
+    metrics = Metrics(plot_dir=cfg.plot_dir, box_bins=cfg.box_bins,
+                      unscale_fn=train_ds.unscale_label)
 
     if _is_main():
         eff_batch = cfg.batch_size * accum * world
@@ -744,7 +870,16 @@ def validate_from_checkpoint(ckpt_path=None, run_inference=True, box_bins=10):
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    metrics = Metrics(plot_dir=cfg.plot_dir, box_bins=cfg.box_bins)
+    # Need a dataset instance for unscale_fn
+    ds_kwargs = dict(
+        target_size=(cfg.img_size, cfg.img_size),
+        normalize=True,
+        center_crop_frac=cfg.center_crop_frac,
+    )
+    val_ds = HVFDataset(split_label="val", **ds_kwargs)
+
+    metrics = Metrics(plot_dir=cfg.plot_dir, box_bins=cfg.box_bins,
+                      unscale_fn=val_ds.unscale_label)
     metrics.epoch = ckpt.get("epoch", 0)
     metrics.opt_step = ckpt.get("opt_step", 0)
 
@@ -757,12 +892,6 @@ def validate_from_checkpoint(ckpt_path=None, run_inference=True, box_bins=10):
         print("Running validation inference...")
         model = OCTCubeFinetune(cfg).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
-        ds_kwargs = dict(
-            target_size=(cfg.img_size, cfg.img_size),
-            normalize=True,
-            center_crop_frac=cfg.center_crop_frac,
-        )
-        val_ds = HVFDataset(split_label="val", **ds_kwargs)
         val_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=cfg.batch_size,
             num_workers=cfg.num_workers, pin_memory=True,
