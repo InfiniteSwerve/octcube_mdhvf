@@ -136,6 +136,34 @@ class HVFDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.data)
 
+    def hodapp_distribution(self):
+        """Print and return the distribution of samples across Hodapp severity classes.
+
+        Hodapp-Parrish-Anderson criteria (MTD in dB):
+          Normal:   > 0
+          Early:    0 to -6  (inclusive of boundary)
+          Moderate: -6 to -12
+          Advanced: <= -12
+        """
+        mtd = np.array(self.data["hvf_mtd"])
+        labels = ["Normal", "Early", "Moderate", "Advanced"]
+        counts = np.array([
+            (mtd > 0).sum(),
+            ((mtd <= 0) & (mtd > -6)).sum(),
+            ((mtd <= -6) & (mtd > -12)).sum(),
+            (mtd <= -12).sum(),
+        ])
+        total = counts.sum()
+        pcts = counts / total * 100
+
+        print(f"\nHodapp Distribution ({self.split_label}, n={total})")
+        print("-" * 40)
+        for lbl, cnt, pct in zip(labels, counts, pcts):
+            print(f"  {lbl:>10s}: {cnt:>5d}  ({pct:5.1f}%)")
+        print("-" * 40)
+
+        return dict(zip(labels, counts.tolist()))
+
     def test_retest_variability(self, n_bins=10):
         """Calculate test-retest variability for patients with multiple samples.
 
