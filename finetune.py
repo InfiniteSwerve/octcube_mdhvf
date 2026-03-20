@@ -8,6 +8,7 @@ Launch:  torchrun --nproc_per_node=4 finetune.py
 """
 
 import argparse
+import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -64,6 +65,63 @@ def _setup_distributed():
 def _cleanup_distributed():
     if _is_distributed():
         dist.destroy_process_group()
+
+
+# ── NCCL Collective Diagnostics ──────────────────────────────────────
+# See finetune_efficientnet.py for full explanation of WHY this exists.
+# TL;DR: NCCL matches collectives by call order with no type checks.
+# DDP injects implicit gradient all-reduces into the same stream as
+# explicit all_gather/barrier calls.  If ranks desync, an all_gather
+# receives gradient bytes reinterpreted as int64 → garbage sizes.
+# The tracker counts explicit ops per rank and cross-checks via a Gloo
+# sideband (CPU, independent of the NCCL stream being diagnosed).
+
+class _NcclTracker:
+    """Counts NCCL collectives per rank and detects desync."""
+
+    def __init__(self):
+        self.count = 0
+        self.enabled = False
+        self._gloo_pg = None
+        self._label = ""
+
+    def setup(self):
+        if not _is_distributed():
+            return
+        self.enabled = True
+        self._gloo_pg = dist.new_group(backend="gloo")
+
+    def tick(self, label: str = ""):
+        self.count += 1
+        self._label = label
+
+    def check_sync(self, location: str):
+        if not self.enabled:
+            return
+        rank = _rank()
+        world = _world_size()
+        local_count = torch.tensor([self.count], dtype=torch.long)
+        all_counts = [torch.zeros(1, dtype=torch.long) for _ in range(world)]
+        dist.all_gather(all_counts, local_count, group=self._gloo_pg)
+        counts = [c.item() for c in all_counts]
+        if len(set(counts)) > 1:
+            msg = (
+                f"\n{'='*70}\n"
+                f"NCCL DESYNC DETECTED at [{location}]\n"
+                f"  Per-rank explicit collective counts: {counts}\n"
+                f"  This rank ({rank}) count: {self.count}, last op: '{self._label}'\n"
+                f"{'='*70}"
+            )
+            print(msg, flush=True)
+            raise RuntimeError(msg)
+
+    def teardown(self):
+        if self._gloo_pg is not None:
+            dist.destroy_process_group(self._gloo_pg)
+            self._gloo_pg = None
+
+
+_nccl = _NcclTracker()
 
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -654,6 +712,7 @@ def save_checkpoint(model, optimizer, scheduler, metrics, path,
 
 def train():
     _setup_distributed()
+    _nccl.setup()
     rank = _rank()
     world = _world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -744,9 +803,12 @@ def train():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs}",
                     leave=True, disable=not _is_main())
         for batch_idx, batch in enumerate(pbar):
-            step_metrics, preds = forward_step(
-                batch["frames"], batch["label"], model, accum,
-            )
+            is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
+            no_sync = model.no_sync() if (_is_distributed() and not is_boundary) else contextlib.nullcontext()
+            with no_sync:
+                step_metrics, preds = forward_step(
+                    batch["frames"], batch["label"], model, accum,
+                )
             accum_loss += step_metrics["loss"]
             accum_preds.append(preds)
             accum_labels.append(batch["label"])
@@ -757,7 +819,6 @@ def train():
                     f"micro={accum_count}/{accum} loss={step_metrics['loss']:.4f}", refresh=False
                 )
 
-            is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
             if is_boundary:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -799,7 +860,7 @@ def train():
                     metrics.plot_scatter()
 
                 if metrics.opt_step % cfg.val_interval == 0:
-                    # All ranks run validation to avoid NCCL timeout
+                    _nccl.check_sync(f"epoch {epoch}, before mid-training validate (opt_step={metrics.opt_step})")
                     val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                     if _is_main():
                         metrics.append("val", val_metrics)
@@ -814,10 +875,12 @@ def train():
                                             val_preds=vp, val_gts=vg)
                             print(f"  New best val R²={val_metrics['r2']:.4f}")
                     if _is_distributed():
+                        _nccl.tick("mid-training post-validate barrier")
                         dist.barrier()
                     model.train()
 
         # End-of-epoch full validation (all ranks run to avoid NCCL timeout)
+        _nccl.check_sync(f"epoch {epoch}, before end-of-epoch validate")
         val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
         if _is_main():
             metrics.append("val", val_metrics)
@@ -846,11 +909,13 @@ def train():
             metrics.refresh_best_val_with_full_data(val_preds, val_gts)
 
         if _is_distributed():
+            _nccl.tick("end-of-epoch post-validate barrier")
             dist.barrier()
         model.train()
 
     if _is_main():
         print("Training complete.")
+    _nccl.teardown()
     _cleanup_distributed()
 
 
