@@ -11,6 +11,8 @@ Launch:  torchrun --nproc_per_node=4 finetune_efficientnet.py
 """
 
 import argparse
+import contextlib
+import struct
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,6 +56,105 @@ def _setup_distributed():
 def _cleanup_distributed():
     if _is_distributed():
         dist.destroy_process_group()
+
+
+# ── NCCL Collective Diagnostics ──────────────────────────────────────
+#
+# WHY THIS EXISTS
+# ===============
+# NCCL (NVIDIA Collective Communications Library) matches collective ops
+# purely by call order — there are no tags, IDs, or names.  If rank 0 does
+# [all_reduce, all_gather] while rank 1 does [all_gather, all_reduce],
+# NCCL happily pairs rank 0's all_reduce with rank 1's all_gather and
+# copies raw bytes between them.  The tensors' dtypes and semantics are
+# invisible to NCCL; it just moves bytes.
+#
+# PyTorch's DDP makes this worse: backward() hooks inject gradient
+# all-reduce ops IMPLICITLY into the same collective stream used by your
+# explicit all_gather/barrier calls.  So if any code path causes one rank
+# to execute a different number of backward() passes, the implicit DDP
+# all-reduces shift the sequence numbers, and your next explicit
+# all_gather picks up gradient bytes instead of the data you sent.
+#
+# That's exactly what happened: _gather_tensors' all_gather for tensor
+# sizes received gradient data (two float32s ≈ 1e-6) reinterpreted as
+# one int64 → max_n = 3.9 × 10^18 → "storage size calculation overflowed".
+#
+# The tracker below counts explicit collective ops per rank so we can
+# detect the exact point where streams diverge.  It exchanges counts via
+# a CPU-based side channel (gloo backend) that is independent of the NCCL
+# stream, so it can't be corrupted by the same desync it's diagnosing.
+#
+
+class _NcclTracker:
+    """Counts NCCL collectives per rank and detects desync.
+
+    Uses a separate Gloo process group as a 'sideband' so the diagnostic
+    itself can't be corrupted by the NCCL desync it's trying to catch.
+    """
+
+    def __init__(self):
+        self.count = 0          # explicit collectives we issued
+        self.enabled = False
+        self._gloo_pg = None    # CPU-side process group for diagnostics
+        self._label = ""        # human-readable location tag
+
+    def setup(self):
+        """Create the Gloo sideband group.  Call after init_process_group."""
+        if not _is_distributed():
+            return
+        self.enabled = True
+        # Create a separate process group on CPU (gloo backend) — this is
+        # completely independent of the NCCL communicator used for training.
+        self._gloo_pg = dist.new_group(backend="gloo")
+
+    def tick(self, label: str = ""):
+        """Record one explicit NCCL collective."""
+        self.count += 1
+        self._label = label
+
+    def check_sync(self, location: str):
+        """Exchange counts via Gloo and raise if ranks disagree.
+
+        This is the key diagnostic: if ranks have different counts, the
+        NCCL streams are already out of sync and the next NCCL collective
+        will cross-match (e.g., an all_gather receiving gradient data).
+        """
+        if not self.enabled:
+            return
+
+        rank = _rank()
+        world = _world_size()
+
+        # Exchange counts over Gloo (CPU, independent of NCCL)
+        local_count = torch.tensor([self.count], dtype=torch.long)
+        all_counts = [torch.zeros(1, dtype=torch.long) for _ in range(world)]
+        dist.all_gather(all_counts, local_count, group=self._gloo_pg)
+
+        counts = [c.item() for c in all_counts]
+        if len(set(counts)) > 1:
+            msg = (
+                f"\n{'='*70}\n"
+                f"NCCL DESYNC DETECTED at [{location}]\n"
+                f"  Per-rank explicit collective counts: {counts}\n"
+                f"  This rank ({rank}) count: {self.count}, last op: '{self._label}'\n"
+                f"  Ranks have executed different numbers of NCCL collectives.\n"
+                f"  The next NCCL op will cross-match (e.g., all_gather receives\n"
+                f"  gradient data instead of the expected payload).\n"
+                f"{'='*70}"
+            )
+            # Print on all ranks so the log is complete even if one dies
+            print(msg, flush=True)
+            raise RuntimeError(msg)
+
+    def teardown(self):
+        if self._gloo_pg is not None:
+            dist.destroy_process_group(self._gloo_pg)
+            self._gloo_pg = None
+
+
+# Global tracker instance
+_nccl = _NcclTracker()
 
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -450,20 +551,41 @@ def _gather_tensors(t: torch.Tensor) -> torch.Tensor:
     local_n = torch.tensor([t.shape[0]], device=device, dtype=torch.long)
     world = _world_size()
     all_n = [torch.zeros(1, device=device, dtype=torch.long) for _ in range(world)]
+
+    _nccl.tick("_gather_tensors: all_gather sizes")
     dist.all_gather(all_n, local_n)
+
     max_n = max(x.item() for x in all_n)
-    # Sanity check: catch corrupted sizes from NCCL failures
+    # Sanity check: catch corrupted sizes from NCCL desync
     if max_n <= 0 or max_n > 10_000_000:
-        raise RuntimeError(
-            f"_gather_tensors: implausible max_n={max_n} "
-            f"(per-rank sizes: {[x.item() for x in all_n]}). "
-            "Likely NCCL desync — check that all ranks iterate the same number of batches."
-        )
+        per_rank = [x.item() for x in all_n]
+        # Decode the garbage value — if it's a desync, the int64 is actually
+        # gradient bytes.  Show both interpretations for diagnosis.
+        diag_lines = [
+            f"_gather_tensors: implausible max_n={max_n}",
+            f"  per-rank sizes (int64): {per_rank}",
+            f"  local tensor shape: {t.shape}, dtype: {t.dtype}",
+            f"  nccl tracker count: {_nccl.count}",
+        ]
+        for i, raw_int in enumerate(per_rank):
+            if raw_int > 10_000_000 or raw_int < 0:
+                raw_bytes = struct.pack("<q", raw_int & 0xFFFFFFFFFFFFFFFF)
+                f1, f2 = struct.unpack("<ff", raw_bytes)
+                diag_lines.append(
+                    f"  rank {i} value as two float32s: [{f1:.6e}, {f2:.6e}]"
+                    f"  (likely gradient data from DDP all-reduce)")
+        msg = "\n".join(diag_lines)
+        print(msg, flush=True)
+        raise RuntimeError(msg)
+
     # Pad to max_n
     padded = torch.zeros(max_n, device=device)
     padded[:t.shape[0]] = t.to(device)
     gathered = [torch.zeros(max_n, device=device) for _ in range(world)]
+
+    _nccl.tick("_gather_tensors: all_gather padded data")
     dist.all_gather(gathered, padded)
+
     # Trim padding from each rank
     return torch.cat([g[:n.int().item()] for g, n in zip(gathered, all_n)]).cpu()
 
@@ -496,6 +618,11 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
                 pbar.set_postfix_str(f"loss={total_loss/n:.4f} n={n}", refresh=False)
     local_preds = torch.cat(all_preds).flatten()
     local_gts = torch.cat(all_labels).flatten()
+
+    # Sync check BEFORE touching NCCL — if the collective streams are
+    # already misaligned, this will catch it via the Gloo sideband before
+    # the all_gather cross-matches with gradient data.
+    _nccl.check_sync(f"validate: before _gather_tensors (n_batches={i+1}, n_samples={n})")
 
     # Gather predictions from all ranks
     preds = _gather_tensors(local_preds)
@@ -537,6 +664,7 @@ def save_checkpoint(model, optimizer, scheduler, metrics, path,
 
 def train():
     _setup_distributed()
+    _nccl.setup()  # Create Gloo sideband for NCCL desync detection
     # Auto-tune cuDNN kernels for fixed input sizes (128x224x224)
     torch.backends.cudnn.benchmark = True
     rank = _rank()
@@ -644,9 +772,23 @@ def train():
         for batch_idx, batch in enumerate(pbar):
             data_time_total += time.time() - _t_data
             _t_compute = time.time()
-            step_metrics, preds = forward_step(
-                batch["frames"], batch["label"], model, accum,
-            )
+
+            # ── model.no_sync() for non-boundary micro-batches ──
+            # Without this, DDP fires a gradient all-reduce on EVERY
+            # backward() call — even intermediate accumulation steps
+            # where we don't want to sync yet.  This is both:
+            #  (a) A correctness fix: without no_sync, accumulated
+            #      gradients are averaged at each micro-step, so the
+            #      effective gradient != the sum over the window.
+            #  (b) A stability fix: fewer implicit NCCL ops in the
+            #      collective stream = fewer chances for desync.
+            is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
+            no_sync = model.no_sync() if (_is_distributed() and not is_boundary) else contextlib.nullcontext()
+            with no_sync:
+                step_metrics, preds = forward_step(
+                    batch["frames"], batch["label"], model, accum,
+                )
+
             torch.cuda.synchronize()
             compute_time_total += time.time() - _t_compute
             _t_data = time.time()
@@ -655,9 +797,6 @@ def train():
             accum_labels.append(batch["label"])
             accum_count += 1
 
-            # (micro-batch postfix removed to prevent tqdm flickering)
-
-            is_boundary = (batch_idx + 1) % accum == 0 or (batch_idx + 1) == total_batches
             if is_boundary:
                 # Gradient clipping (standard practice)
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -702,6 +841,7 @@ def train():
                     metrics.plot_scatter()
 
                 if metrics.opt_step % cfg.val_interval == 0:
+                    _nccl.check_sync(f"epoch {epoch}, before mid-training validate (opt_step={metrics.opt_step})")
                     val_metrics, vp, vg = validate(model, val_loader, cfg, max_volumes=cfg.val_max_volumes)
                     if _is_main():
                         metrics.append("val", val_metrics)
@@ -716,10 +856,12 @@ def train():
                                             val_preds=vp, val_gts=vg)
                             print(f"  New best val R²={val_metrics['r2']:.4f}")
                     if _is_distributed():
+                        _nccl.tick("mid-training post-validate barrier")
                         dist.barrier()
                     model.train()
 
         # End-of-epoch full validation — distributed across all GPUs
+        _nccl.check_sync(f"epoch {epoch}, before end-of-epoch validate")
         val_metrics, val_preds, val_gts = validate(model, val_loader, cfg)
         if _is_main():
             metrics.append("val", val_metrics)
@@ -748,11 +890,13 @@ def train():
             metrics.refresh_best_val_with_full_data(val_preds, val_gts)
 
         if _is_distributed():
+            _nccl.tick("end-of-epoch post-validate barrier")
             dist.barrier()
         model.train()
 
     if _is_main():
         print("Training complete.")
+    _nccl.teardown()
     _cleanup_distributed()
 
 
