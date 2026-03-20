@@ -447,11 +447,18 @@ def _gather_tensors(t: torch.Tensor) -> torch.Tensor:
     if not _is_distributed():
         return t
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
-    local_n = torch.tensor([t.shape[0]], device=device)
+    local_n = torch.tensor([t.shape[0]], device=device, dtype=torch.long)
     world = _world_size()
     all_n = [torch.zeros(1, device=device, dtype=torch.long) for _ in range(world)]
     dist.all_gather(all_n, local_n)
     max_n = max(x.item() for x in all_n)
+    # Sanity check: catch corrupted sizes from NCCL failures
+    if max_n <= 0 or max_n > 10_000_000:
+        raise RuntimeError(
+            f"_gather_tensors: implausible max_n={max_n} "
+            f"(per-rank sizes: {[x.item() for x in all_n]}). "
+            "Likely NCCL desync — check that all ranks iterate the same number of batches."
+        )
     # Pad to max_n
     padded = torch.zeros(max_n, device=device)
     padded[:t.shape[0]] = t.to(device)
@@ -467,16 +474,16 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
     device = next(eval_model.parameters()).device
     all_preds, all_labels = [], []
     total_loss, n = 0.0, 0
-    # max_volumes is per-rank when distributed
-    max_per_rank = None
+    # Limit by batch count (not sample count) so all ranks iterate the same
+    # number of times — avoids NCCL desync in _gather_tensors.
+    max_batches = len(loader)
     if max_volumes is not None:
-        max_per_rank = max(1, max_volumes // _world_size())
-    total_batches = len(loader) if max_per_rank is None else min(len(loader), max_per_rank)
-    pbar = tqdm(loader, total=total_batches, desc="Validating",
+        max_batches = min(max_batches, max(1, max_volumes // (_world_size() * cfg.batch_size)))
+    pbar = tqdm(loader, total=max_batches, desc="Validating",
                 disable=not _is_main(), leave=False)
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        for batch in pbar:
-            if max_per_rank is not None and n >= max_per_rank:
+        for i, batch in enumerate(pbar):
+            if i >= max_batches:
                 break
             imgs = batch["frames"].to(device)
             labels = batch["label"].to(device)
@@ -570,6 +577,7 @@ def train():
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         sampler=val_sampler, num_workers=cfg.num_workers,
         pin_memory=True, prefetch_factor=4, persistent_workers=True,
+        drop_last=True,
     )
 
     # Model — from scratch, no pretraining
