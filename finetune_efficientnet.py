@@ -628,6 +628,12 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
     preds = _gather_tensors(local_preds)
     gts = _gather_tensors(local_gts)
 
+    # Aggregate loss across ranks so reported val loss is over the full set
+    if _is_distributed():
+        loss_tensor = torch.tensor([total_loss, float(n)], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss, n = loss_tensor[0].item(), int(loss_tensor[1].item())
+
     mae = (preds - gts).abs().mean().item()
     r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item() if preds.std() > 1e-8 else 0.0
     ss_res = ((preds - gts) ** 2).sum().item()

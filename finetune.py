@@ -652,6 +652,33 @@ def forward_step(
     return {"loss": loss.item(), "pred_std": pred.detach().std().item()}, pred.detach().cpu()
 
 
+def _gather_variable_tensors(local: Tensor) -> Tensor:
+    """Gather 1-D tensors of potentially different lengths across ranks.
+
+    DistributedSampler pads the dataset so all ranks get the same count,
+    but with max_volumes the ranks may stop at different points.  This
+    handles the general case by communicating sizes first.
+    """
+    if not _is_distributed():
+        return local
+    device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
+    local_size = torch.tensor([local.shape[0]], dtype=torch.long, device=device)
+    world = _world_size()
+    all_sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world)]
+    dist.all_gather(all_sizes, local_size)
+    max_size = max(s.item() for s in all_sizes)
+
+    # Pad local tensor to max_size
+    padded = torch.zeros(max_size, dtype=local.dtype, device=device)
+    padded[: local.shape[0]] = local.to(device)
+    gathered = [torch.zeros(max_size, dtype=local.dtype, device=device) for _ in range(world)]
+    dist.all_gather(gathered, padded)
+
+    # Trim padding from each rank
+    parts = [gathered[i][: all_sizes[i].item()].cpu() for i in range(world)]
+    return torch.cat(parts)
+
+
 def validate(model, loader, cfg: Config, max_volumes: int | None = None):
     eval_model = model.module if isinstance(model, DDP) else model
     eval_model.eval()
@@ -674,10 +701,30 @@ def validate(model, loader, cfg: Config, max_volumes: int | None = None):
             n += imgs.shape[0]
             if _is_main():
                 pbar.set_postfix_str(f"loss={total_loss/n:.4f} n={n}", refresh=False)
-    preds = torch.cat(all_preds)
-    gts = torch.cat(all_labels)
+    local_preds = torch.cat(all_preds) if all_preds else torch.zeros(0)
+    local_gts = torch.cat(all_labels) if all_labels else torch.zeros(0)
+
+    # Gather predictions from all ranks so metrics use the full val set
+    preds = _gather_variable_tensors(local_preds)
+    gts = _gather_variable_tensors(local_gts)
+
+    # DistributedSampler pads the dataset to make it evenly divisible,
+    # which can duplicate a few samples. Trim to the actual dataset size.
+    if hasattr(loader, "dataset"):
+        actual_len = len(loader.dataset)
+        if max_volumes is not None:
+            actual_len = min(actual_len, max_volumes)
+        preds = preds[:actual_len]
+        gts = gts[:actual_len]
+
+    # Aggregate loss across ranks
+    if _is_distributed():
+        loss_tensor = torch.tensor([total_loss, float(n)], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss, n = loss_tensor[0].item(), int(loss_tensor[1].item())
+
     mae = (preds - gts).abs().mean().item()
-    r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item()
+    r = torch.corrcoef(torch.stack([preds, gts]))[0, 1].item() if len(preds) > 1 else 0.0
     ss_res = ((preds - gts) ** 2).sum().item()
     ss_tot = ((gts - gts.mean()) ** 2).sum().item()
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -750,9 +797,13 @@ def train():
         num_workers=cfg.num_workers,
         pin_memory=True,
     )
+    val_sampler = DistributedSampler(val_ds, num_replicas=world, rank=rank,
+                                      shuffle=False) if world > 1 else None
     val_loader = torch.utils.data.DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
         num_workers=cfg.num_workers,
         pin_memory=True,
     )
